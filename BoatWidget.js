@@ -144,12 +144,13 @@ function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
-// Matches the "YYYY-MM-DDTHH:mm:ss" shape echoed back in query.queryTime,
-// used as the optional {time} path segment to page into later windows.
+// The API expects yyyy-MM-dd'T'HH:mm (no seconds) for the optional {time}
+// path segment used to page into later departure windows - confirmed via
+// its own error message when seconds were included.
 function formatApiTime(date) {
   return (
     `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}` +
-    `T${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+    `T${pad2(date.getHours())}:${pad2(date.getMinutes())}`
   );
 }
 
@@ -236,7 +237,15 @@ async function collectUpcomingBoats(apiKey, stopId) {
 
   for (let page = 0; page < CONFIG.maxLookaheadPages && results.length < CONFIG.targetBoatCount; page++) {
     const timeParam = cursor ? formatApiTime(cursor) : undefined;
-    const raw = await fetchDeparturesWindow(apiKey, stopId, timeParam);
+    let raw;
+    try {
+      raw = await fetchDeparturesWindow(apiKey, stopId, timeParam);
+    } catch (err) {
+      if (!config.runsInWidget) {
+        console.log(`Stopped paging (page ${page}, time ${timeParam || "now"}): ${err.message}`);
+      }
+      break; // keep whatever boats earlier pages already found
+    }
     if (!raw.length) break;
 
     for (const dep of raw) {
