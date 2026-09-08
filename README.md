@@ -39,10 +39,21 @@ Edit the `CONFIG` block at the top of `BoatWidget.js`:
 ```js
 const CONFIG = {
   originStopName: "Saltholmen",
-  destinationName: "Köpstadsö",
+  lineDesignation: "281", // the line that calls at Köpstadsö
+  targetBoatCount: 10,    // how many upcoming boats to look for
   refreshMinutes: 10,
 };
 ```
+
+Köpstadsö is a via-stop on line 281 (Saltholmen → Köpstadsö → Styrsö Bratten
+→ Donsö → Vrångö), not any boat's final destination — the API's departure
+board only reports each boat's final stop (e.g. "Vrångö"), so the script
+filters by line number rather than by destination name. If Västtrafik ever
+renumbers the line, update `lineDesignation`.
+
+To see more than the widget's on-screen rows, run the script manually in
+Scriptable (▶️ Play) — it prints the next `targetBoatCount` departures to
+the console log and shows a larger in-app preview.
 
 ## Notes & limitations
 
@@ -51,13 +62,10 @@ const CONFIG = {
   the widget is allowed to refresh, but very infrequently-viewed widgets can
   be throttled by the OS. Opening your phone regularly keeps it closer to
   10 minutes.
-- **Field names**: Trafiklab's newer Realtime API's exact JSON field names
-  couldn't be fully verified against live docs while building this (network
-  access to trafiklab.se was blocked in the build environment). The script
-  therefore scans each departure's fields heuristically (looking for keys
-  containing things like `realtime`, `scheduled`, `delay`, `destination`)
-  rather than hardcoding exact paths. If a field ever looks wrong once you
-  have a working API key, run the script manually in Scriptable and share
-  what you see — it's a quick fix to tighten the field matching.
+- **Finding 10 boats requires paging across multiple 60-minute windows**
+  (the API always returns a fixed 60-minute window per call), since the
+  line runs roughly hourly. The script advances the window using each
+  page's last departure time; if that ever stops making progress it gives
+  up early and shows however many boats it found.
 - If the API call fails (no signal, bad key, etc.), the widget falls back to
   the last successfully fetched departures and shows a "saved data" note.

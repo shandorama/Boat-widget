@@ -7,6 +7,14 @@
  * Data source: Trafiklab Realtime API (covers Västtrafik / Styrsöbolaget
  * archipelago ferries). Get a free API key at https://www.trafiklab.se/
  *
+ * Köpstadsö is a via-stop, not a final destination: the boat that calls
+ * there is line 281 (Saltholmen -> Köpstadsö -> Styrsö Bratten -> Donsö ->
+ * Vrångö), shown by Västtrafik/Styrsöbolaget's own timetables. The API's
+ * departure board only reports each boat's *final* destination (e.g.
+ * "Vrångö"), not the stops along the way, so we filter by line number
+ * instead of by destination name. If Västtrafik ever renumbers the line,
+ * update CONFIG.lineDesignation below.
+ *
  * First-time setup:
  *   1. Install "Scriptable" from the App Store.
  *   2. Create a new script, paste this whole file in, name it "BoatWidget".
@@ -16,15 +24,14 @@
  *      Saltholmen stop id once and cache it locally.
  *   4. Long-press your home screen -> add a widget -> Scriptable -> choose
  *      the "BoatWidget" script and "Medium" size.
- *
- * See CONFIG below to change the route or refresh interval.
  */
 
 const CONFIG = {
   originStopName: "Saltholmen",
-  destinationName: "Köpstadsö",
+  lineDesignation: "281", // the Saltholmen -> Köpstadsö -> ... -> Vrångö line
+  targetBoatCount: 10, // how many upcoming boats to look for
+  maxLookaheadPages: 12, // safety cap: ~12 hours of 60-minute windows
   refreshMinutes: 10,
-  // The API always returns a 60 minute look-ahead window per call.
 };
 
 const KEYCHAIN_KEY = "boatWidgetTrafiklabApiKey";
@@ -110,11 +117,11 @@ async function findStopId(apiKey, name) {
   if (!config.runsInWidget) {
     console.log(`Stop lookup raw response for "${name}": ${JSON.stringify(json)}`);
   }
-  // The Trafiklab Realtime API groups platforms/quays for a physical
-  // location under stop_groups[].id, with the individual stops (e.g. the
-  // boat quay vs. the tram/bus stop) listed in stop_groups[].stops[].
-  // Using the group id gives departures across all modes at that hub,
-  // which we then filter down to BOAT + destination further on.
+  // Trafiklab groups platforms/quays for a physical location under
+  // stop_groups[].id, with individual stops (e.g. the boat quay vs. the
+  // tram/bus stop) listed in stop_groups[].stops[]. The group id gives a
+  // departure board across all modes at that hub, which we then filter
+  // down to the boat line we want.
   const groups = Array.isArray(json.stop_groups) ? json.stop_groups : [];
   if (!groups.length) return null;
 
@@ -130,115 +137,78 @@ async function findStopId(apiKey, name) {
   return chosen.id || null;
 }
 
-async function fetchDepartures(apiKey, stopId) {
-  const url = `${API_BASE}/departures/${encodeURIComponent(stopId)}?key=${encodeURIComponent(apiKey)}`;
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+// Matches the "YYYY-MM-DDTHH:mm:ss" shape echoed back in query.queryTime,
+// used as the optional {time} path segment to page into later windows.
+function formatApiTime(date) {
+  return (
+    `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}` +
+    `T${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+  );
+}
+
+async function fetchDeparturesWindow(apiKey, stopId, time) {
+  const url = time
+    ? `${API_BASE}/departures/${encodeURIComponent(stopId)}/${encodeURIComponent(time)}?key=${encodeURIComponent(apiKey)}`
+    : `${API_BASE}/departures/${encodeURIComponent(stopId)}?key=${encodeURIComponent(apiKey)}`;
   const json = await fetchJSON(url);
   if (!config.runsInWidget) {
-    console.log(`Departures raw response for stop ${stopId}: ${JSON.stringify(json)}`);
+    console.log(
+      `Departures raw response for stop ${stopId}${time ? " at " + time : ""}: ${JSON.stringify(json).slice(0, 4000)}`
+    );
   }
-  return extractArray(json, ["departures", "data", "results", "Departure"]);
+  return Array.isArray(json.departures) ? json.departures : [];
 }
 
-function extractArray(json, keys) {
-  if (Array.isArray(json)) return json;
-  if (!json || typeof json !== "object") return [];
-  for (const key of keys) {
-    const value = json[key];
-    if (Array.isArray(value)) return value;
-    if (value && typeof value === "object") {
-      const nested = extractArray(value, keys);
-      if (nested.length) return nested;
+function toBoat(dep) {
+  const route = dep.route || {};
+  const scheduled = new Date(dep.scheduled);
+  const realtime = dep.realtime ? new Date(dep.realtime) : scheduled;
+  return {
+    time: realtime,
+    scheduled,
+    delayMinutes: Math.round((realtime.getTime() - scheduled.getTime()) / 60000),
+    canceled: !!dep.canceled,
+    line: route.designation || "",
+    destination: (route.destination && route.destination.name) || route.direction || "",
+    tripId: dep.trip && dep.trip.trip_id,
+  };
+}
+
+async function collectUpcomingBoats(apiKey, stopId) {
+  const results = [];
+  const seenTripIds = new Set();
+  let cursor = null; // Date to page into the next 60-minute window
+
+  for (let page = 0; page < CONFIG.maxLookaheadPages && results.length < CONFIG.targetBoatCount; page++) {
+    const timeParam = cursor ? formatApiTime(cursor) : undefined;
+    const raw = await fetchDeparturesWindow(apiKey, stopId, timeParam);
+    if (!raw.length) break;
+
+    for (const dep of raw) {
+      const route = dep.route || {};
+      if (route.transport_mode !== "BOAT") continue;
+      if (route.designation !== CONFIG.lineDesignation) continue;
+      if (dep.canceled) continue;
+      const tripId = dep.trip && dep.trip.trip_id;
+      if (tripId) {
+        if (seenTripIds.has(tripId)) continue;
+        seenTripIds.add(tripId);
+      }
+      results.push(toBoat(dep));
     }
-  }
-  return [];
-}
 
-// ---------- flexible field extraction ----------
-// The exact JSON field names for the (newer) Trafiklab Realtime API weren't
-// verifiable from this environment, so instead of hardcoding brittle paths
-// we scan each departure object (a couple of levels deep, e.g. dep.route.x)
-// for keys that *look* like what we need. Run the script manually once and
-// check the on-screen "debug" preview / console log if a field ever looks
-// wrong - the raw JSON is logged there.
-
-function collectPaths(obj, prefix, depth, out) {
-  if (!obj || typeof obj !== "object" || depth > 2) return;
-  for (const key of Object.keys(obj)) {
-    const value = obj[key];
-    const path = prefix ? `${prefix}.${key}` : key;
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      collectPaths(value, path, depth + 1, out);
-    } else {
-      out.push([path.toLowerCase(), value]);
-    }
-  }
-}
-
-function findValue(dep, patterns) {
-  const kv = [];
-  collectPaths(dep, "", 0, kv);
-  for (const pattern of patterns) {
-    const hit = kv.find(([path]) => pattern.test(path));
-    if (hit && hit[1] !== null && hit[1] !== undefined && hit[1] !== "") {
-      return hit[1];
-    }
-  }
-  return null;
-}
-
-function parseTimeValue(raw) {
-  if (!raw) return null;
-  const d = new Date(raw);
-  if (!isNaN(d.getTime())) return d;
-  // Fall back for a bare "HH:mm[:ss]" string: attach to today.
-  const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(String(raw).trim());
-  if (m) {
-    const now = new Date();
-    now.setHours(Number(m[1]), Number(m[2]), Number(m[3] || 0), 0);
-    return now;
-  }
-  return null;
-}
-
-function parseDeparture(dep) {
-  const scheduledRaw = findValue(dep, [
-    /sched.*dep.*time/,
-    /departure.*sched/,
-    /^scheduled$/,
-    /scheduled.*time/,
-  ]);
-  const realtimeRaw = findValue(dep, [
-    /real.*dep.*time/,
-    /departure.*real/,
-    /^realtime$/,
-    /realtime.*time/,
-    /expected/,
-  ]);
-  const scheduled = parseTimeValue(scheduledRaw);
-  const realtime = parseTimeValue(realtimeRaw);
-  const time = realtime || scheduled;
-
-  let delayMinutes = null;
-  const delayRaw = findValue(dep, [/delay/]);
-  if (typeof delayRaw === "number") {
-    delayMinutes = Math.round(Math.abs(delayRaw) > 1000 ? delayRaw / 60 : delayRaw);
-  } else if (scheduled && realtime) {
-    delayMinutes = Math.round((realtime.getTime() - scheduled.getTime()) / 60000);
+    const lastRaw = raw[raw.length - 1];
+    const lastScheduled = lastRaw ? new Date(lastRaw.scheduled) : null;
+    if (!lastScheduled || (cursor && lastScheduled.getTime() <= cursor.getTime())) break;
+    cursor = new Date(lastScheduled.getTime() + 60000);
   }
 
-  const canceledRaw = findValue(dep, [/cancel/]);
-  const canceled = canceledRaw === true || canceledRaw === "true" || canceledRaw === 1;
-
-  const destination = findValue(dep, [/destination/, /direction/]) || "";
-  const line =
-    findValue(dep, [/designation/, /line.*(name|number|id)$/, /route.*(name|short)/]) || "";
-
-  return { time, scheduled, realtime, delayMinutes, canceled, destination: String(destination), line: String(line) };
-}
-
-function matchesDestination(dep, filterText) {
-  const destination = String(findValue(dep, [/destination/, /direction/]) || "").toLowerCase();
-  return destination.includes(filterText.toLowerCase());
+  results.sort((a, b) => a.time.getTime() - b.time.getTime());
+  return results.slice(0, CONFIG.targetBoatCount);
 }
 
 // ---------- widget rendering ----------
@@ -250,13 +220,13 @@ function timeLabel(date) {
 }
 
 function addHeader(widget) {
-  const title = widget.addText(`⛴️ ${CONFIG.originStopName} → ${CONFIG.destinationName}`);
+  const title = widget.addText(`⛴️ ${CONFIG.originStopName} → Köpstadsö`);
   title.font = Font.boldSystemFont(14);
   title.textColor = Color.white();
   widget.addSpacer(6);
 }
 
-function addDepartureRow(widget, dep, stale) {
+function addDepartureRow(widget, dep) {
   const row = widget.addStack();
   row.centerAlignContent();
 
@@ -279,12 +249,10 @@ function addDepartureRow(widget, dep, stale) {
   status.font = Font.systemFont(13);
   status.textColor = statusColor;
 
-  if (dep.line) {
-    row.addSpacer();
-    const line = row.addText(dep.line);
-    line.font = Font.systemFont(13);
-    line.textColor = new Color("#8e8e93");
-  }
+  row.addSpacer();
+  const line = row.addText(`Line ${dep.line}`);
+  line.font = Font.systemFont(13);
+  line.textColor = new Color("#8e8e93");
 
   widget.addSpacer(4);
 }
@@ -308,8 +276,8 @@ async function createWidget() {
   widget.backgroundColor = new Color("#0b1f33");
   widget.setPadding(12, 12, 12, 12);
 
-  const family = config.widgetFamily || "medium";
-  const maxResults = family === "small" ? 1 : family === "large" ? 5 : 3;
+  const family = config.widgetFamily || (config.runsInWidget ? "medium" : "large");
+  const maxResults = { small: 1, medium: 4, large: CONFIG.targetBoatCount }[family] || 4;
 
   addHeader(widget);
 
@@ -333,20 +301,14 @@ async function createWidget() {
       throw new Error(`Could not find stop "${CONFIG.originStopName}"`);
     }
 
-    const rawDepartures = await fetchDepartures(apiKey, stopId);
-    const parsed = rawDepartures
-      .filter((d) => matchesDestination(d, CONFIG.destinationName))
-      .map(parseDeparture)
-      .filter((d) => d.time && !d.canceled)
-      .sort((a, b) => a.time.getTime() - b.time.getTime())
-      .slice(0, maxResults);
+    const boats = await collectUpcomingBoats(apiKey, stopId);
 
-    if (!parsed.length) {
-      addMessage(widget, `No ${CONFIG.destinationName} departures in the next hour.`);
+    if (!boats.length) {
+      addMessage(widget, `No line ${CONFIG.lineDesignation} boats found in the lookahead window.`);
     } else {
-      for (const dep of parsed) addDepartureRow(widget, dep);
+      for (const dep of boats.slice(0, maxResults)) addDepartureRow(widget, dep);
       writeCache({
-        lastDepartures: parsed.map((d) => ({
+        lastDepartures: boats.map((d) => ({
           time: d.time.toISOString(),
           delayMinutes: d.delayMinutes,
           canceled: d.canceled,
@@ -356,11 +318,18 @@ async function createWidget() {
       });
     }
     addFooter(widget, new Date());
+
+    if (!config.runsInWidget) {
+      console.log(
+        `Next ${boats.length} boat(s) to Köpstadsö: ` +
+          boats.map((b) => `${timeLabel(b.time)}${b.delayMinutes ? ` (+${b.delayMinutes}m)` : ""}`).join(", ")
+      );
+    }
   } catch (err) {
     const cache = readCache();
     const cached = cache.lastDepartures || [];
     if (cached.length) {
-      for (const raw of cached) {
+      for (const raw of cached.slice(0, maxResults)) {
         addDepartureRow(widget, {
           time: new Date(raw.time),
           delayMinutes: raw.delayMinutes,
@@ -383,7 +352,7 @@ async function main() {
   if (config.runsInWidget) {
     Script.setWidget(widget);
   } else {
-    await widget.presentMedium();
+    await widget.presentLarge();
   }
   Script.complete();
 }
