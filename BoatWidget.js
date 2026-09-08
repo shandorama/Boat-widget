@@ -110,12 +110,24 @@ async function findStopId(apiKey, name) {
   if (!config.runsInWidget) {
     console.log(`Stop lookup raw response for "${name}": ${JSON.stringify(json)}`);
   }
-  const stops = extractArray(json, ["stops", "data", "results", "stopLocationList", "StopLocation"]);
-  if (!stops.length) return null;
+  // The Trafiklab Realtime API groups platforms/quays for a physical
+  // location under stop_groups[].id, with the individual stops (e.g. the
+  // boat quay vs. the tram/bus stop) listed in stop_groups[].stops[].
+  // Using the group id gives departures across all modes at that hub,
+  // which we then filter down to BOAT + destination further on.
+  const groups = Array.isArray(json.stop_groups) ? json.stop_groups : [];
+  if (!groups.length) return null;
+
   const lower = name.toLowerCase();
-  const exact = stops.find((s) => (s.name || s.stopName || "").toLowerCase() === lower);
-  const pick = exact || stops[0];
-  return pick.id || pick.stop_id || pick.stopId || pick.extId || null;
+  const matching = groups.filter(
+    (g) =>
+      (g.name || "").toLowerCase().includes(lower) ||
+      (g.stops || []).some((s) => (s.name || "").toLowerCase() === lower)
+  );
+  const pool = matching.length ? matching : groups;
+  const withBoat = pool.find((g) => (g.transport_modes || []).includes("BOAT"));
+  const chosen = withBoat || pool[0];
+  return chosen.id || null;
 }
 
 async function fetchDepartures(apiKey, stopId) {
