@@ -107,18 +107,38 @@ async function fetchJSON(url) {
 async function findStopId(apiKey, name) {
   const url = `${API_BASE}/stops/name/${encodeURIComponent(name)}?key=${encodeURIComponent(apiKey)}`;
   const json = await fetchJSON(url);
-  const stops = Array.isArray(json) ? json : json.stops || json.data || [];
+  if (!config.runsInWidget) {
+    console.log(`Stop lookup raw response for "${name}": ${JSON.stringify(json)}`);
+  }
+  const stops = extractArray(json, ["stops", "data", "results", "stopLocationList", "StopLocation"]);
   if (!stops.length) return null;
   const lower = name.toLowerCase();
-  const exact = stops.find((s) => (s.name || "").toLowerCase() === lower);
-  return (exact || stops[0]).id || (exact || stops[0]).stop_id || null;
+  const exact = stops.find((s) => (s.name || s.stopName || "").toLowerCase() === lower);
+  const pick = exact || stops[0];
+  return pick.id || pick.stop_id || pick.stopId || pick.extId || null;
 }
 
 async function fetchDepartures(apiKey, stopId) {
   const url = `${API_BASE}/departures/${encodeURIComponent(stopId)}?key=${encodeURIComponent(apiKey)}`;
   const json = await fetchJSON(url);
+  if (!config.runsInWidget) {
+    console.log(`Departures raw response for stop ${stopId}: ${JSON.stringify(json)}`);
+  }
+  return extractArray(json, ["departures", "data", "results", "Departure"]);
+}
+
+function extractArray(json, keys) {
   if (Array.isArray(json)) return json;
-  return json.departures || json.data || [];
+  if (!json || typeof json !== "object") return [];
+  for (const key of keys) {
+    const value = json[key];
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === "object") {
+      const nested = extractArray(value, keys);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
 }
 
 // ---------- flexible field extraction ----------
