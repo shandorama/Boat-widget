@@ -39,17 +39,20 @@ Edit the `CONFIG` block at the top of `BoatWidget.js`:
 ```js
 const CONFIG = {
   originStopName: "Saltholmen",
-  lineDesignation: "281", // the line that calls at Köpstadsö
-  targetBoatCount: 10,    // how many upcoming boats to look for
+  destinationStopName: "Köpstadsö",
+  targetBoatCount: 10, // how many upcoming boats to look for
   refreshMinutes: 10,
 };
 ```
 
-Köpstadsö is a via-stop on line 281 (Saltholmen → Köpstadsö → Styrsö Bratten
-→ Donsö → Vrångö), not any boat's final destination — the API's departure
-board only reports each boat's final stop (e.g. "Vrångö"), so the script
-filters by line number rather than by destination name. If Västtrafik ever
-renumbers the line, update `lineDesignation`.
+Köpstadsö is a via-stop, not any boat's final destination (more than one
+line calls there - at least 281 and 282), and the API's departure board
+only reports each boat's final stop (e.g. "Vrångö"), never the stops along
+the way. So instead of guessing line numbers, the script asks Trafiklab's
+**Trip Details** endpoint for each boat's actual stop-by-stop route and
+keeps only the ones that call at `destinationStopName`. Which lines qualify
+is cached locally (re-checked every 30 days) so this only costs one extra
+API call the first time a given line is seen, not on every refresh.
 
 To see more than the widget's on-screen rows, run the script manually in
 Scriptable (▶️ Play) — it prints the next `targetBoatCount` departures to

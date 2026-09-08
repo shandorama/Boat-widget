@@ -7,13 +7,15 @@
  * Data source: Trafiklab Realtime API (covers Västtrafik / Styrsöbolaget
  * archipelago ferries). Get a free API key at https://www.trafiklab.se/
  *
- * Köpstadsö is a via-stop, not a final destination: the boat that calls
- * there is line 281 (Saltholmen -> Köpstadsö -> Styrsö Bratten -> Donsö ->
- * Vrångö), shown by Västtrafik/Styrsöbolaget's own timetables. The API's
- * departure board only reports each boat's *final* destination (e.g.
- * "Vrångö"), not the stops along the way, so we filter by line number
- * instead of by destination name. If Västtrafik ever renumbers the line,
- * update CONFIG.lineDesignation below.
+ * Köpstadsö is a via-stop, not a final destination, and more than one line
+ * calls there (281 and 282 both do, per Västtrafik/Styrsöbolaget's own
+ * timetables - there may be others). The departure board only reports each
+ * boat's *final* destination (e.g. "Vrångö"), not the stops along the way,
+ * so instead of guessing line numbers this script asks Trafiklab's Trip
+ * Details endpoint for each boat's full stop list and keeps only the ones
+ * that actually call at Köpstadsö. Which lines qualify is cached locally
+ * (by line number) so this lookup only costs an extra API call the first
+ * time a given line is seen.
  *
  * First-time setup:
  *   1. Install "Scriptable" from the App Store.
@@ -28,9 +30,10 @@
 
 const CONFIG = {
   originStopName: "Saltholmen",
-  lineDesignation: "281", // the Saltholmen -> Köpstadsö -> ... -> Vrångö line
+  destinationStopName: "Köpstadsö",
   targetBoatCount: 10, // how many upcoming boats to look for
   maxLookaheadPages: 12, // safety cap: ~12 hours of 60-minute windows
+  lineKnowledgeMaxAgeDays: 30, // re-verify a line's route after this long
   refreshMinutes: 10,
 };
 
@@ -175,7 +178,55 @@ function toBoat(dep) {
     line: route.designation || "",
     destination: (route.destination && route.destination.name) || route.direction || "",
     tripId: dep.trip && dep.trip.trip_id,
+    startDate: dep.trip && dep.trip.start_date,
   };
+}
+
+// Recursively collect every string found under a "name" key, anywhere in
+// the trip details response - this avoids having to guess the exact shape
+// of the per-stop list in that response.
+function collectNames(obj, depth, out) {
+  if (!obj || depth > 5) return;
+  if (Array.isArray(obj)) {
+    for (const item of obj) collectNames(item, depth + 1, out);
+    return;
+  }
+  if (typeof obj !== "object") return;
+  if (typeof obj.name === "string") out.push(obj.name);
+  for (const key of Object.keys(obj)) collectNames(obj[key], depth + 1, out);
+}
+
+async function tripVisitsStop(apiKey, tripId, startDate, stopName) {
+  const url = `${API_BASE}/trips/${encodeURIComponent(tripId)}/${encodeURIComponent(startDate)}?key=${encodeURIComponent(apiKey)}`;
+  const json = await fetchJSON(url);
+  if (!config.runsInWidget) {
+    console.log(`Trip details raw response for ${tripId}/${startDate}: ${JSON.stringify(json).slice(0, 4000)}`);
+  }
+  const names = [];
+  collectNames(json, 0, names);
+  const lower = stopName.toLowerCase();
+  return names.some((n) => n.toLowerCase() === lower);
+}
+
+function readLineKnowledge() {
+  return readCache().lineKnowledge || {};
+}
+
+function isLineKnowledgeFresh(entry) {
+  if (!entry || !entry.checkedAt) return false;
+  const ageDays = (Date.now() - new Date(entry.checkedAt).getTime()) / 86400000;
+  return ageDays < CONFIG.lineKnowledgeMaxAgeDays;
+}
+
+async function lineServesDestination(apiKey, line, tripId, startDate) {
+  const knowledge = readLineKnowledge();
+  const cached = knowledge[line];
+  if (isLineKnowledgeFresh(cached)) return cached.serves;
+
+  const serves = await tripVisitsStop(apiKey, tripId, startDate, CONFIG.destinationStopName);
+  knowledge[line] = { serves, checkedAt: new Date().toISOString() };
+  writeCache({ lineKnowledge: knowledge });
+  return serves;
 }
 
 async function collectUpcomingBoats(apiKey, stopId) {
@@ -191,13 +242,18 @@ async function collectUpcomingBoats(apiKey, stopId) {
     for (const dep of raw) {
       const route = dep.route || {};
       if (route.transport_mode !== "BOAT") continue;
-      if (route.designation !== CONFIG.lineDesignation) continue;
       if (dep.canceled) continue;
       const tripId = dep.trip && dep.trip.trip_id;
+      const startDate = dep.trip && dep.trip.start_date;
       if (tripId) {
         if (seenTripIds.has(tripId)) continue;
         seenTripIds.add(tripId);
       }
+      if (!tripId || !startDate) continue;
+
+      const serves = await lineServesDestination(apiKey, route.designation || "", tripId, startDate);
+      if (!serves) continue;
+
       results.push(toBoat(dep));
     }
 
@@ -304,7 +360,7 @@ async function createWidget() {
     const boats = await collectUpcomingBoats(apiKey, stopId);
 
     if (!boats.length) {
-      addMessage(widget, `No line ${CONFIG.lineDesignation} boats found in the lookahead window.`);
+      addMessage(widget, `No boats to ${CONFIG.destinationStopName} found in the lookahead window.`);
     } else {
       for (const dep of boats.slice(0, maxResults)) addDepartureRow(widget, dep);
       writeCache({
