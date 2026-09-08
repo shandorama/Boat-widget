@@ -31,7 +31,7 @@ const CONFIG = {
   targetBoatCount: 5, // how many upcoming boats to look for
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
-  lineKnowledgeMaxAgeDays: 30, // re-verify a line's route after this long
+  tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
   refreshMinutes: 10,
 };
 
@@ -207,24 +207,40 @@ async function tripGoesToward(apiKey, tripId, startDate, originName, destination
   return destinationIdx > originIdx;
 }
 
-function readLineKnowledge() {
-  return readCache().lineKnowledge || {};
+// Cache per *trip instance* (trip_id + start_date), not per line number.
+// The same line can run different stopping patterns on different trips
+// (an express that skips a stop vs. a local that calls at it), so "line X
+// always/never serves this route" is the wrong granularity - a specific
+// trip's own stop order never changes once it's scheduled, though, so
+// caching that is safe and saves re-querying Trip Details on every
+// refresh for a boat we've already checked.
+function tripCacheKey(tripId, startDate) {
+  return `${tripId}_${startDate}`;
 }
 
-function isLineKnowledgeFresh(entry) {
-  if (!entry || !entry.checkedAt) return false;
-  const ageDays = (Date.now() - new Date(entry.checkedAt).getTime()) / 86400000;
-  return ageDays < CONFIG.lineKnowledgeMaxAgeDays;
+function readTripKnowledge() {
+  return readCache().tripKnowledge || {};
 }
 
-async function lineServesRoute(apiKey, line, tripId, startDate) {
-  const knowledge = readLineKnowledge();
-  const cached = knowledge[line];
-  if (isLineKnowledgeFresh(cached)) return cached.serves;
+function pruneTripKnowledge(knowledge) {
+  const cutoff = Date.now() - CONFIG.tripKnowledgeMaxAgeDays * 86400000;
+  const pruned = {};
+  for (const [key, entry] of Object.entries(knowledge)) {
+    if (entry && entry.checkedAt && new Date(entry.checkedAt).getTime() >= cutoff) {
+      pruned[key] = entry;
+    }
+  }
+  return pruned;
+}
+
+async function tripServesRoute(apiKey, tripId, startDate) {
+  const knowledge = readTripKnowledge();
+  const key = tripCacheKey(tripId, startDate);
+  if (knowledge[key]) return knowledge[key].serves;
 
   const serves = await tripGoesToward(apiKey, tripId, startDate, CONFIG.originStopName, CONFIG.destinationStopName);
-  knowledge[line] = { serves, checkedAt: new Date().toISOString() };
-  writeCache({ lineKnowledge: knowledge });
+  knowledge[key] = { serves, checkedAt: new Date().toISOString() };
+  writeCache({ tripKnowledge: pruneTripKnowledge(knowledge) });
   return serves;
 }
 
@@ -258,7 +274,7 @@ async function collectUpcomingBoats(apiKey, stopId) {
         }
         if (!tripId || !startDate) continue;
 
-        const serves = await lineServesRoute(apiKey, route.designation || "", tripId, startDate);
+        const serves = await tripServesRoute(apiKey, tripId, startDate);
         if (!serves) continue;
 
         results.push(toBoat(dep));

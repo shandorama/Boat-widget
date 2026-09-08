@@ -55,14 +55,17 @@ const CONFIG = {
 Köpstadsö is a via-stop, not any boat's final destination (more than one
 line calls there - at least 281 and 282), and the API's departure board
 only reports each boat's final stop (e.g. "Vrångö"), never the stops along
-the way. So instead of guessing line numbers, the script asks Trafiklab's
-**Trip Details** endpoint for each boat's actual, ordered stop-by-stop
-route and keeps only the ones that travel from `originStopName` *toward*
-`destinationStopName` (checking stop order, not just presence, so a boat
-that already passed the destination and is heading further out doesn't
-count). Which lines qualify is cached locally per direction (re-checked
-every 30 days), so this only costs one extra API call the first time a
-given line is seen, not on every refresh.
+the way. Line numbers also aren't reliable on their own: the same line can
+run different stopping patterns on different trips (e.g. an express that
+skips a stop some runs make). So instead of trusting line numbers, the
+script checks Trafiklab's **Trip Details** endpoint for *every individual
+boat trip*, using its actual ordered stop-by-stop route, and keeps only
+the ones that travel from `originStopName` *toward* `destinationStopName`
+(checking stop order, not just presence, so a boat that already passed the
+destination and is heading further out doesn't count). Each specific
+trip's result is cached locally per direction (a trip's own stop pattern
+never changes once scheduled, so this is safe), so a boat already seen on
+a previous refresh isn't re-checked every 10 minutes.
 
 The search for `targetBoatCount` upcoming boats pages forward through
 60-minute windows and keeps going across any overnight service gap into

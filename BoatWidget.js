@@ -9,15 +9,18 @@
  *
  * Köpstadsö is a via-stop, not a final destination, and more than one line
  * calls there (281 and 282 both do, per Västtrafik/Styrsöbolaget's own
- * timetables - there may be others). The departure board only reports each
- * boat's *final* destination (e.g. "Vrångö"), not the stops along the way,
- * so instead of guessing line numbers this script asks Trafiklab's Trip
- * Details endpoint for each boat's full, ordered stop list and keeps only
- * the ones that actually travel from the origin stop *toward* the
- * destination stop (checking stop order, not just presence, so a boat
- * already past the destination and heading the other way doesn't count).
- * Which lines qualify is cached locally (by line number) so this lookup
- * only costs an extra API call the first time a given line is seen.
+ * timetables - there may be others). Worse, the same line number doesn't
+ * reliably call at the same stops on every run (express vs. local
+ * variants), so line numbers can't be trusted at all. The departure board
+ * also only reports each boat's *final* destination (e.g. "Vrångö"), not
+ * the stops along the way. So every single boat departure is individually
+ * checked against Trafiklab's Trip Details endpoint for its full, ordered
+ * stop list, keeping only the ones that actually travel from the origin
+ * stop *toward* the destination stop (checking stop order, not just
+ * presence, so a boat already past the destination and heading further
+ * out doesn't count). Each specific trip's result is cached locally
+ * (a trip's own stop pattern never changes once scheduled) so a boat seen
+ * on a previous refresh isn't re-checked every 10 minutes.
  *
  * For the return trip (e.g. Köpstadsö -> Saltholmen), copy this file into
  * a second Scriptable script and swap originStopName/destinationStopName
@@ -40,7 +43,7 @@ const CONFIG = {
   targetBoatCount: 5, // how many upcoming boats to look for
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
-  lineKnowledgeMaxAgeDays: 30, // re-verify a line's route after this long
+  tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
   refreshMinutes: 10,
 };
 
@@ -216,24 +219,40 @@ async function tripGoesToward(apiKey, tripId, startDate, originName, destination
   return destinationIdx > originIdx;
 }
 
-function readLineKnowledge() {
-  return readCache().lineKnowledge || {};
+// Cache per *trip instance* (trip_id + start_date), not per line number.
+// The same line can run different stopping patterns on different trips
+// (an express that skips a stop vs. a local that calls at it), so "line X
+// always/never serves this route" is the wrong granularity - a specific
+// trip's own stop order never changes once it's scheduled, though, so
+// caching that is safe and saves re-querying Trip Details on every
+// refresh for a boat we've already checked.
+function tripCacheKey(tripId, startDate) {
+  return `${tripId}_${startDate}`;
 }
 
-function isLineKnowledgeFresh(entry) {
-  if (!entry || !entry.checkedAt) return false;
-  const ageDays = (Date.now() - new Date(entry.checkedAt).getTime()) / 86400000;
-  return ageDays < CONFIG.lineKnowledgeMaxAgeDays;
+function readTripKnowledge() {
+  return readCache().tripKnowledge || {};
 }
 
-async function lineServesRoute(apiKey, line, tripId, startDate) {
-  const knowledge = readLineKnowledge();
-  const cached = knowledge[line];
-  if (isLineKnowledgeFresh(cached)) return cached.serves;
+function pruneTripKnowledge(knowledge) {
+  const cutoff = Date.now() - CONFIG.tripKnowledgeMaxAgeDays * 86400000;
+  const pruned = {};
+  for (const [key, entry] of Object.entries(knowledge)) {
+    if (entry && entry.checkedAt && new Date(entry.checkedAt).getTime() >= cutoff) {
+      pruned[key] = entry;
+    }
+  }
+  return pruned;
+}
+
+async function tripServesRoute(apiKey, tripId, startDate) {
+  const knowledge = readTripKnowledge();
+  const key = tripCacheKey(tripId, startDate);
+  if (knowledge[key]) return knowledge[key].serves;
 
   const serves = await tripGoesToward(apiKey, tripId, startDate, CONFIG.originStopName, CONFIG.destinationStopName);
-  knowledge[line] = { serves, checkedAt: new Date().toISOString() };
-  writeCache({ lineKnowledge: knowledge });
+  knowledge[key] = { serves, checkedAt: new Date().toISOString() };
+  writeCache({ tripKnowledge: pruneTripKnowledge(knowledge) });
   return serves;
 }
 
@@ -267,7 +286,7 @@ async function collectUpcomingBoats(apiKey, stopId) {
         }
         if (!tripId || !startDate) continue;
 
-        const serves = await lineServesRoute(apiKey, route.designation || "", tripId, startDate);
+        const serves = await tripServesRoute(apiKey, tripId, startDate);
         if (!serves) continue;
 
         results.push(toBoat(dep));
