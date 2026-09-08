@@ -2,41 +2,32 @@
 // icon-color: deep-blue; icon-glyph: ship;
 
 /**
- * Saltholmen -> Köpstadsö boat departures widget.
+ * Köpstadsö -> Saltholmen boat departures widget (the return trip).
+ *
+ * This is the mirror image of BoatWidget.js (Saltholmen -> Köpstadsö) with
+ * originStopName/destinationStopName swapped - see that file for the full
+ * explanation of how route-matching works. Keep both files in sync if you
+ * change the matching logic; this one is otherwise byte-for-byte the same.
  *
  * Data source: Trafiklab Realtime API (covers Västtrafik / Styrsöbolaget
  * archipelago ferries). Get a free API key at https://www.trafiklab.se/
  *
- * Köpstadsö is a via-stop, not a final destination, and more than one line
- * calls there (281 and 282 both do, per Västtrafik/Styrsöbolaget's own
- * timetables - there may be others). The departure board only reports each
- * boat's *final* destination (e.g. "Vrångö"), not the stops along the way,
- * so instead of guessing line numbers this script asks Trafiklab's Trip
- * Details endpoint for each boat's full, ordered stop list and keeps only
- * the ones that actually travel from the origin stop *toward* the
- * destination stop (checking stop order, not just presence, so a boat
- * already past the destination and heading the other way doesn't count).
- * Which lines qualify is cached locally (by line number) so this lookup
- * only costs an extra API call the first time a given line is seen.
- *
- * For the return trip (e.g. Köpstadsö -> Saltholmen), copy this file into
- * a second Scriptable script and swap originStopName/destinationStopName
- * in CONFIG below.
- *
  * First-time setup:
  *   1. Install "Scriptable" from the App Store.
- *   2. Create a new script, paste this whole file in, name it "BoatWidget".
+ *   2. Create a new script, paste this whole file in, name it
+ *      "BoatWidgetReturn".
  *   3. Tap the ▶️ Play button once (run it inside the app, not as a widget
  *      yet). It will ask for your Trafiklab API key and save it in the iOS
- *      Keychain (never stored in this file). It will also look up the
- *      origin stop id once and cache it locally.
+ *      Keychain (shared with BoatWidget.js if you have both installed).
+ *      It will also look up the Köpstadsö stop id once and cache it
+ *      locally.
  *   4. Long-press your home screen -> add a widget -> Scriptable -> choose
- *      the "BoatWidget" script and "Medium" size.
+ *      the "BoatWidgetReturn" script and "Medium" size.
  */
 
 const CONFIG = {
-  originStopName: "Saltholmen",
-  destinationStopName: "Köpstadsö",
+  originStopName: "Köpstadsö",
+  destinationStopName: "Saltholmen",
   targetBoatCount: 5, // how many upcoming boats to look for
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
