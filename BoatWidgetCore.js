@@ -27,11 +27,13 @@
  *
  * The widget shows the next 4 regular boats, plus a 5th row (in a
  * different color) for the last boat before the overnight service gap -
- * useful if you're out and need to know your last ride home. Finding it
- * requires checking many boats' Trip Details, which is too slow to redo on
- * every ~10-minute widget refresh (iOS gives widgets a strict time budget
- * to finish in), so it's cached and only actually re-searched roughly once
- * per night - see getLastBoat() and findLastBoatBeforeGap().
+ * useful if you're out and need to know your last ride home. It's simply
+ * the last matching boat departing before lastBoatCutoffHour (04:00).
+ * Finding it requires checking several boats' Trip Details, which is too
+ * slow to redo on every ~10-minute widget refresh (iOS gives widgets a
+ * strict time budget to finish in), so it's cached and only actually
+ * re-searched roughly once per night - see getLastBoat() and
+ * collectLastBoatBeforeCutoff().
  *
  * For the return trip (e.g. Köpstadsö -> Saltholmen), see
  * BoatWidgetCoreReturn.js - same logic, originStopName/destinationStopName
@@ -42,11 +44,7 @@ const CONFIG = {
   originStopName: "Saltholmen",
   destinationStopName: "Köpstadsö",
   targetBoatCount: 4, // how many regular upcoming boats to show
-  lastBoatGapMinutes: 90, // a gap at least this long marks the overnight break
-  lastBoatSearchCount: 15, // how many boats ahead to look at when finding it -
-  // kept modest since this runs its full search roughly once per night now
-  // (see getLastBoat()), but still costs several Trip Details calls on
-  // that one run and widgets have a strict time budget
+  lastBoatCutoffHour: 4, // the last boat is the last one before this hour
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
   tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
@@ -282,12 +280,18 @@ async function tripServesRoute(apiKey, tripId, startDate) {
   return serves;
 }
 
-async function collectUpcomingBoats(apiKey, stopId, count) {
+// Shared pagination: walks forward through 60-minute departure windows,
+// verifying each BOAT departure's actual route via tripServesRoute(), and
+// stops as soon as shouldStop(results, cursor) says so. shouldCollect(boat)
+// decides whether a verified boat is kept in the results. Used both for
+// "the next few boats" (stop once we have enough) and "the last boat
+// before 04:00" (stop once we've paged past that time) below.
+async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect }) {
   const results = [];
   const seenTripIds = new Set();
   let cursor = null; // Date to page into the next 60-minute window
 
-  for (let page = 0; page < CONFIG.maxLookaheadPages && results.length < count; page++) {
+  for (let page = 0; page < CONFIG.maxLookaheadPages && !shouldStop(results, cursor); page++) {
     const timeParam = cursor ? formatApiTime(cursor) : undefined;
     let raw;
     try {
@@ -320,14 +324,14 @@ async function collectUpcomingBoats(apiKey, stopId, count) {
         const serves = await tripServesRoute(apiKey, tripId, startDate);
         if (!serves) continue;
 
-        results.push(toBoat(dep));
+        const boat = toBoat(dep);
+        if (shouldCollect(boat)) results.push(boat);
       }
     }
 
     // Advance to the next 60-minute window regardless of whether this one
     // had any departures at all, so an overnight service gap (e.g. no
-    // boats/trams/buses for a few hours) doesn't stop the search early -
-    // we want the next N boats "regardless of end of day".
+    // boats/trams/buses for a few hours) doesn't stop the search early.
     const lastRaw = raw[raw.length - 1];
     const lastScheduled = lastRaw ? new Date(lastRaw.scheduled) : null;
     const nextCursor =
@@ -338,39 +342,56 @@ async function collectUpcomingBoats(apiKey, stopId, count) {
   }
 
   results.sort((a, b) => a.time.getTime() - b.time.getTime());
+  return results;
+}
+
+async function collectNextBoats(apiKey, stopId, count) {
+  const results = await collectMatchingBoats(apiKey, stopId, {
+    shouldStop: (results) => results.length >= count,
+    shouldCollect: () => true,
+  });
   return results.slice(0, count);
 }
 
-// The archipelago boats run frequently all day and then stop for a few
-// hours overnight before the first morning departure. The boat right
-// before that gap is the last one you can catch home for the night - find
-// it by walking the (chronologically sorted) upcoming boats and returning
-// the one right before the first gap that's at least lastBoatGapMinutes
-// long. Returns null if no such gap shows up within the fetched boats.
-function findLastBoatBeforeGap(sortedBoats) {
-  for (let i = 0; i < sortedBoats.length - 1; i++) {
-    const gapMinutes = (sortedBoats[i + 1].time.getTime() - sortedBoats[i].time.getTime()) / 60000;
-    if (gapMinutes >= CONFIG.lastBoatGapMinutes) {
-      return sortedBoats[i];
-    }
+// Returns the next occurrence of `hour`:00 strictly after `from` - today's
+// if it hasn't happened yet, otherwise tomorrow's.
+function nextClockTime(from, hour) {
+  const next = new Date(from);
+  next.setHours(hour, 0, 0, 0);
+  if (next.getTime() <= from.getTime()) {
+    next.setDate(next.getDate() + 1);
   }
-  return null;
+  return next;
 }
 
-// Finding the last boat means checking many boats' Trip Details, which is
-// too slow to redo on every ~10-minute widget refresh (iOS gives widgets a
-// strict time budget, and doing this every refresh is what caused
-// timeouts). Instead, cache the identified last boat and reuse it across
-// refreshes until it's actually in the past - so the expensive wide search
-// only runs roughly once per night, not every refresh.
+// The archipelago boats run frequently all day, then stop for a few hours
+// overnight before the first morning departure (typically ~04:30-05:47).
+// The last one you can catch home for the night is simply the last
+// matching boat that departs before the next occurrence of
+// lastBoatCutoffHour (04:00) - so page forward only as far as that cutoff
+// and take the latest boat found before it. Returns null if none does.
+async function collectLastBoatBeforeCutoff(apiKey, stopId, cutoff) {
+  const results = await collectMatchingBoats(apiKey, stopId, {
+    shouldStop: (results, cursor) => !!cursor && cursor.getTime() >= cutoff.getTime(),
+    shouldCollect: (boat) => boat.time.getTime() < cutoff.getTime(),
+  });
+  return results.length ? results[results.length - 1] : null;
+}
+
+// Finding the last boat means checking several boats' Trip Details, which
+// is too slow to redo on every ~10-minute widget refresh (iOS gives
+// widgets a strict time budget, and doing this every refresh is what
+// caused timeouts). Instead, cache the identified last boat and reuse it
+// across refreshes until it's actually in the past - so this search only
+// runs roughly once per night, not every refresh.
 async function getLastBoat(apiKey, stopId) {
   const cached = readCache().lastBoat;
   if (cached && new Date(cached.time).getTime() > Date.now()) {
     return Object.assign({}, cached, { time: new Date(cached.time) });
   }
 
-  const wideBoats = await collectUpcomingBoats(apiKey, stopId, CONFIG.lastBoatSearchCount);
-  const found = findLastBoatBeforeGap(wideBoats);
+  const cutoff = nextClockTime(new Date(), CONFIG.lastBoatCutoffHour);
+  const found = await collectLastBoatBeforeCutoff(apiKey, stopId, cutoff);
   if (found) {
     writeCache({
       lastBoat: {
@@ -508,7 +529,7 @@ async function createWidget() {
     // far more expensive but internally cached and normally only actually
     // searches once per night - see getLastBoat().
     const [regularBoats, lastBoat] = await Promise.all([
-      collectUpcomingBoats(apiKey, stopId, CONFIG.targetBoatCount + 2),
+      collectNextBoats(apiKey, stopId, CONFIG.targetBoatCount + 2),
       getLastBoat(apiKey, stopId),
     ]);
 

@@ -85,8 +85,7 @@ const CONFIG = {
   originStopName: "Saltholmen",
   destinationStopName: "Köpstadsö",
   targetBoatCount: 4, // how many regular upcoming boats to show
-  lastBoatGapMinutes: 90, // a gap at least this long marks the overnight break
-  lastBoatSearchCount: 25, // how many boats ahead to look at when finding it
+  lastBoatCutoffHour: 4, // the last boat is the last one before this hour
   refreshMinutes: 10,
 };
 ```
@@ -113,14 +112,19 @@ row in a different color (purple, with a 🌙) for the **last boat before
 the overnight service gap** — handy if you're out late and need to know
 your last ride home.
 
-It's found by fetching up to `lastBoatSearchCount` (25) boats ahead and
-walking through them in order to find the first gap between two
-consecutive boats that's at least `lastBoatGapMinutes` (90) long — the
-boat right before that gap is the last one before the archipelago boats
-stop for the night (typically resuming around 04:30–05:47). That boat is
-pulled out of the regular list and always shown as the 5th row, even if
-it's hours away from the next 4 departures shown above it (e.g. it's
-currently mid-afternoon and tonight's last boat is still hours off).
+It's simply the last matching boat departing before `lastBoatCutoffHour`
+(04:00) — the archipelago boats stop for the night at some point before
+then and resume around 04:30–05:47. That boat is pulled out of the regular
+list and always shown as the 5th row, even if it's hours away from the
+next 4 departures shown above it (e.g. it's currently mid-afternoon and
+tonight's last boat is still hours off).
+
+Finding it means paging forward through departures and checking each
+boat's Trip Details, which is too slow to redo on every ~10-minute widget
+refresh (this is what caused timeouts on the actual home screen widget
+before). So the result is cached and only actually re-searched once the
+previously-found last boat has passed — normally about once per night,
+not every refresh.
 
 To see more than the widget's on-screen rows, run the script manually in
 Scriptable (▶️ Play) — it prints the full list to the console log and
