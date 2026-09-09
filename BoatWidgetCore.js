@@ -279,7 +279,14 @@ function pruneTripKnowledge(knowledge) {
 async function tripServesRoute(apiKey, tripId, startDate) {
   const knowledge = readTripKnowledge();
   const key = tripCacheKey(tripId, startDate);
-  if (knowledge[key]) return knowledge[key];
+  const cached = knowledge[key];
+  // Entries cached before travel time was added don't have this property
+  // at all (as opposed to having it set to null, a legitimate "couldn't
+  // compute one" result) - treat those as a miss so they get one fresh
+  // check instead of permanently missing a travel time.
+  if (cached && Object.prototype.hasOwnProperty.call(cached, "durationMinutes")) {
+    return cached;
+  }
 
   const { serves, durationMinutes } = await tripGoesToward(
     apiKey,
