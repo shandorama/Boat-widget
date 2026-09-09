@@ -128,13 +128,15 @@ function delay(ms) {
 // with a short backoff before giving up, and add a touch of random jitter
 // before it (see main()) so both widgets are less likely to collide in the
 // first place. iOS gives home screen widgets a strict time budget to
-// finish in, so every request also gets a short timeout and retries are
-// kept few and short rather than thorough - a fast failure that falls
-// back to cached data beats a slow one that gets the whole widget killed.
+// finish in, and a weak connection makes every individual request slow,
+// so every request gets a short timeout and at most one quick retry - a
+// fast failure that falls back to cached data (or, for an individual
+// trip check, is simply skipped for this run - see collectMatchingBoats)
+// beats a slow one that eats the whole time budget or hangs the app.
 async function fetchJSON(url, attempt) {
   attempt = attempt || 1;
   const req = new Request(url);
-  req.timeoutInterval = 8;
+  req.timeoutInterval = 4;
   const text = await req.loadString();
   const status = req.response ? req.response.statusCode : null;
   let json = null;
@@ -147,7 +149,7 @@ async function fetchJSON(url, attempt) {
     const msg = (json && (json.message || json.error)) || text || `HTTP ${status}`;
     const retryable = status === 429 || status >= 500;
     if (retryable && attempt < 2) {
-      await delay(attempt * 800);
+      await delay(400);
       return fetchJSON(url, attempt + 1);
     }
     throw new Error(`API error ${status}: ${msg}`);
@@ -327,6 +329,7 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
 
     if (raw.length) {
       let hitBudget = false;
+      let hadFailure = false;
       for (const dep of raw) {
         const route = dep.route || {};
         if (route.transport_mode !== "BOAT") continue;
@@ -346,12 +349,26 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
         }
         if (!isCached) newChecks++;
 
-        const serves = await tripServesRoute(apiKey, tripId, startDate);
+        // A weak connection can make any single check slow or fail outright
+        // (timeout, dropped connection). One flaky trip shouldn't abort the
+        // whole search - skip it for this run (uncached, so a later
+        // refresh retries it fresh) rather than throwing.
+        let serves;
+        try {
+          serves = await tripServesRoute(apiKey, tripId, startDate);
+        } catch (err) {
+          if (!config.runsInWidget) {
+            console.log(`Skipped trip ${tripId} (check failed): ${err.message}`);
+          }
+          hadFailure = true;
+          continue;
+        }
         if (!serves) continue;
 
         const boat = toBoat(dep);
         if (shouldCollect(boat)) results.push(boat);
       }
+      if (hadFailure) complete = false;
       if (hitBudget) {
         complete = false;
         break;
@@ -375,9 +392,13 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
 }
 
 async function collectNextBoats(apiKey, stopId, count) {
+  // Capped like the last-boat search below - a weak connection can make
+  // even this small fetch slow, and there's no reliable "manual runs have
+  // more headroom" assumption to lean on here either.
   const { results } = await collectMatchingBoats(apiKey, stopId, {
     shouldStop: (results) => results.length >= count,
     shouldCollect: () => true,
+    maxNewTripChecks: CONFIG.maxNewTripChecksPerRun,
   });
   return results.slice(0, count);
 }
@@ -433,14 +454,18 @@ async function getLastBoat(apiKey, stopId) {
   }
 
   const cutoff = nextClockTime(new Date(), CONFIG.lastBoatCutoffHour);
-  // Only cap this in the actual widget, which has proven to have a much
-  // stricter time budget than a manual run in the app - no need to slow
-  // down manual testing with the same caution.
-  const budget = config.runsInWidget ? CONFIG.maxNewTripChecksPerRun : undefined;
-  const { found, complete } = await collectLastBoatBeforeCutoff(apiKey, stopId, cutoff, budget);
+  // Capped in both the widget and manual runs - a weak connection can make
+  // even a manual run painfully slow (or make individual checks fail
+  // outright), so there's no reliable extra headroom to assume there.
+  const { found, complete } = await collectLastBoatBeforeCutoff(
+    apiKey,
+    stopId,
+    cutoff,
+    CONFIG.maxNewTripChecksPerRun
+  );
   if (!complete) {
     if (!config.runsInWidget) {
-      console.log("Last-boat search incomplete this run (budget hit) - will resume next refresh.");
+      console.log("Last-boat search incomplete this run (budget hit or a check failed) - will resume next refresh.");
     }
     return null;
   }
