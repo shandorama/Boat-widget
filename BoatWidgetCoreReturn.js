@@ -22,6 +22,8 @@ const CONFIG = {
   destinationStopName: "Saltholmen",
   targetBoatCount: 4, // how many regular upcoming boats to show
   lastBoatCutoffHour: 4, // the last boat is the last one before this hour
+  maxNewTripChecksPerRun: 5, // cap on *uncached* Trip Details lookups per
+  // widget refresh when searching for the last boat - see getLastBoat()
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
   tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
@@ -263,10 +265,24 @@ async function tripServesRoute(apiKey, tripId, startDate) {
 // decides whether a verified boat is kept in the results. Used both for
 // "the next few boats" (stop once we have enough) and "the last boat
 // before 04:00" (stop once we've paged past that time) below.
-async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect }) {
+//
+// maxNewTripChecks caps how many *not-yet-cached* Trip Details lookups
+// this call is willing to make - each trip is checked once per day (every
+// day's boats get fresh trip ids, so yesterday's cache never carries
+// over), and a cold search covering many hours could need enough of them
+// to blow past a widget's strict execution time budget on its own. When
+// the cap is hit, the search stops early and reports itself incomplete;
+// the boats it did verify are still cached via tripServesRoute() though,
+// so a follow-up call (the next refresh) picks up further ahead with that
+// much less new work left to do - the search completes over a few
+// refreshes instead of risking a timeout trying to finish in one.
+async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect, maxNewTripChecks }) {
   const results = [];
   const seenTripIds = new Set();
+  const knowledge = readTripKnowledge();
   let cursor = null; // Date to page into the next 60-minute window
+  let newChecks = 0;
+  let complete = true;
 
   for (let page = 0; page < CONFIG.maxLookaheadPages && !shouldStop(results, cursor); page++) {
     const timeParam = cursor ? formatApiTime(cursor) : undefined;
@@ -282,10 +298,12 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect 
       // cached data (or shows a real error) instead of wrongly reporting
       // an empty schedule. If earlier pages already found boats, keep them.
       if (!results.length) throw err;
+      complete = false;
       break;
     }
 
     if (raw.length) {
+      let hitBudget = false;
       for (const dep of raw) {
         const route = dep.route || {};
         if (route.transport_mode !== "BOAT") continue;
@@ -298,11 +316,22 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect 
         }
         if (!tripId || !startDate) continue;
 
+        const isCached = !!knowledge[tripCacheKey(tripId, startDate)];
+        if (!isCached && maxNewTripChecks != null && newChecks >= maxNewTripChecks) {
+          hitBudget = true;
+          continue; // skip further *new* checks this run, but keep collecting cache hits
+        }
+        if (!isCached) newChecks++;
+
         const serves = await tripServesRoute(apiKey, tripId, startDate);
         if (!serves) continue;
 
         const boat = toBoat(dep);
         if (shouldCollect(boat)) results.push(boat);
+      }
+      if (hitBudget) {
+        complete = false;
+        break;
       }
     }
 
@@ -319,11 +348,11 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect 
   }
 
   results.sort((a, b) => a.time.getTime() - b.time.getTime());
-  return results;
+  return { results, complete };
 }
 
 async function collectNextBoats(apiKey, stopId, count) {
-  const results = await collectMatchingBoats(apiKey, stopId, {
+  const { results } = await collectMatchingBoats(apiKey, stopId, {
     shouldStop: (results) => results.length >= count,
     shouldCollect: () => true,
   });
@@ -346,21 +375,34 @@ function nextClockTime(from, hour) {
 // The last one you can catch home for the night is simply the last
 // matching boat that departs before the next occurrence of
 // lastBoatCutoffHour (04:00) - so page forward only as far as that cutoff
-// and take the latest boat found before it. Returns null if none does.
-async function collectLastBoatBeforeCutoff(apiKey, stopId, cutoff) {
-  const results = await collectMatchingBoats(apiKey, stopId, {
+// and take the latest boat found before it.
+async function collectLastBoatBeforeCutoff(apiKey, stopId, cutoff, maxNewTripChecks) {
+  const { results, complete } = await collectMatchingBoats(apiKey, stopId, {
     shouldStop: (results, cursor) => !!cursor && cursor.getTime() >= cutoff.getTime(),
     shouldCollect: (boat) => boat.time.getTime() < cutoff.getTime(),
+    maxNewTripChecks,
   });
-  return results.length ? results[results.length - 1] : null;
+  return { found: results.length ? results[results.length - 1] : null, complete };
 }
 
 // Finding the last boat means checking several boats' Trip Details, which
 // is too slow to redo on every ~10-minute widget refresh (iOS gives
 // widgets a strict time budget, and doing this every refresh is what
-// caused timeouts). Instead, cache the identified last boat and reuse it
-// across refreshes until it's actually in the past - so this search only
-// runs roughly once per night, not every refresh.
+// caused timeouts). Two layers guard against that:
+//
+// 1. Once found, the result is cached and reused across refreshes until
+//    it's actually in the past - so the search only needs to happen
+//    roughly once per night, not every refresh.
+// 2. Each day's boats get entirely new trip ids (yesterday's cache never
+//    carries over), so even that once-a-night search can still be a cold
+//    start covering many hours. maxNewTripChecksPerRun caps how much new
+//    work a single run is willing to do; if the search doesn't finish
+//    within that budget, no (possibly-wrong, since incomplete) guess is
+//    cached or shown - the row is just omitted for this refresh. The
+//    trips that were checked are still cached via tripServesRoute()
+//    though, so the next refresh picks up with that much less new work
+//    left, and the search completes - and the row appears - within a few
+//    refreshes rather than risking a timeout trying to finish in one.
 async function getLastBoat(apiKey, stopId) {
   const cached = readCache().lastBoat;
   if (cached && new Date(cached.time).getTime() > Date.now()) {
@@ -368,7 +410,17 @@ async function getLastBoat(apiKey, stopId) {
   }
 
   const cutoff = nextClockTime(new Date(), CONFIG.lastBoatCutoffHour);
-  const found = await collectLastBoatBeforeCutoff(apiKey, stopId, cutoff);
+  // Only cap this in the actual widget, which has proven to have a much
+  // stricter time budget than a manual run in the app - no need to slow
+  // down manual testing with the same caution.
+  const budget = config.runsInWidget ? CONFIG.maxNewTripChecksPerRun : undefined;
+  const { found, complete } = await collectLastBoatBeforeCutoff(apiKey, stopId, cutoff, budget);
+  if (!complete) {
+    if (!config.runsInWidget) {
+      console.log("Last-boat search incomplete this run (budget hit) - will resume next refresh.");
+    }
+    return null;
+  }
   if (found) {
     writeCache({
       lastBoat: {
