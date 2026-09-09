@@ -197,10 +197,15 @@ function toBoat(dep) {
   };
 }
 
-// Confirmed trip-details shape: { ..., calls: [{ stop: { name, ... }, ... }] }
-// in stop order. We check that destinationName appears *after* originName
-// in that order, so a boat already past the destination and heading away
-// from it (e.g. continuing on to a further island) doesn't get included.
+// Confirmed trip-details shape: { ..., calls: [{ stop: { name, ... },
+// scheduledDeparture, realtimeDeparture, scheduledArrival, realtimeArrival,
+// ... }] } in stop order. We check that destinationName appears *after*
+// originName in that order, so a boat already past the destination and
+// heading away from it (e.g. continuing on to a further island) doesn't
+// get included. While we're in here anyway, also work out the travel
+// time (origin's departure to destination's arrival) - since this trip
+// details call already has to happen to verify direction, getting the
+// travel time too costs no extra API calls.
 async function tripGoesToward(apiKey, tripId, startDate, originName, destinationName) {
   const url = `${API_BASE}/trips/${encodeURIComponent(tripId)}/${encodeURIComponent(startDate)}?key=${encodeURIComponent(apiKey)}`;
   const json = await fetchJSON(url);
@@ -211,8 +216,20 @@ async function tripGoesToward(apiKey, tripId, startDate, originName, destination
   const names = calls.map((c) => ((c.stop && c.stop.name) || "").toLowerCase());
   const originIdx = names.indexOf(originName.toLowerCase());
   const destinationIdx = names.indexOf(destinationName.toLowerCase());
-  if (originIdx === -1 || destinationIdx === -1) return false;
-  return destinationIdx > originIdx;
+  if (originIdx === -1 || destinationIdx === -1 || destinationIdx <= originIdx) {
+    return { serves: false, durationMinutes: null };
+  }
+
+  const departureRaw = calls[originIdx].realtimeDeparture || calls[originIdx].scheduledDeparture;
+  const arrivalRaw = calls[destinationIdx].realtimeArrival || calls[destinationIdx].scheduledArrival;
+  const departure = departureRaw ? new Date(departureRaw) : null;
+  const arrival = arrivalRaw ? new Date(arrivalRaw) : null;
+  const durationMinutes =
+    departure && arrival && !isNaN(departure.getTime()) && !isNaN(arrival.getTime())
+      ? Math.round((arrival.getTime() - departure.getTime()) / 60000)
+      : null;
+
+  return { serves: true, durationMinutes };
 }
 
 // Cache per *trip instance* (trip_id + start_date), not per line number.
@@ -241,15 +258,23 @@ function pruneTripKnowledge(knowledge) {
   return pruned;
 }
 
+// Returns { serves, durationMinutes } - cached per trip, so this only
+// costs an API call the first time a given trip is seen.
 async function tripServesRoute(apiKey, tripId, startDate) {
   const knowledge = readTripKnowledge();
   const key = tripCacheKey(tripId, startDate);
-  if (knowledge[key]) return knowledge[key].serves;
+  if (knowledge[key]) return knowledge[key];
 
-  const serves = await tripGoesToward(apiKey, tripId, startDate, CONFIG.originStopName, CONFIG.destinationStopName);
-  knowledge[key] = { serves, checkedAt: new Date().toISOString() };
+  const { serves, durationMinutes } = await tripGoesToward(
+    apiKey,
+    tripId,
+    startDate,
+    CONFIG.originStopName,
+    CONFIG.destinationStopName
+  );
+  knowledge[key] = { serves, durationMinutes, checkedAt: new Date().toISOString() };
   writeCache({ tripKnowledge: pruneTripKnowledge(knowledge) });
-  return serves;
+  return knowledge[key];
 }
 
 async function collectUpcomingBoats(apiKey, stopId, count) {
@@ -291,18 +316,18 @@ async function collectUpcomingBoats(apiKey, stopId, count) {
         // outright. One flaky trip shouldn't abort the whole search - skip
         // it for this run (uncached, so a later refresh retries it fresh)
         // rather than throwing.
-        let serves;
+        let tripInfo;
         try {
-          serves = await tripServesRoute(apiKey, tripId, startDate);
+          tripInfo = await tripServesRoute(apiKey, tripId, startDate);
         } catch (err) {
           if (!config.runsInWidget) {
             console.log(`Skipped trip ${tripId} (check failed): ${err.message}`);
           }
           continue;
         }
-        if (!serves) continue;
+        if (!tripInfo.serves) continue;
 
-        results.push(toBoat(dep));
+        results.push(Object.assign(toBoat(dep), { durationMinutes: tripInfo.durationMinutes }));
       }
     }
 
@@ -362,7 +387,9 @@ function addDepartureRow(widget, dep) {
   status.textColor = statusColor;
 
   row.addSpacer();
-  const line = row.addText(`Line ${dep.line}`);
+  const lineLabel =
+    dep.durationMinutes != null ? `Line ${dep.line} · ${dep.durationMinutes} min` : `Line ${dep.line}`;
+  const line = row.addText(lineLabel);
   line.font = Font.systemFont(13);
   line.textColor = new Color("#8e8e93");
 
@@ -433,6 +460,7 @@ async function createWidget() {
           delayMinutes: d.delayMinutes,
           canceled: d.canceled,
           line: d.line,
+          durationMinutes: d.durationMinutes,
         })),
         lastUpdated: new Date().toISOString(),
       });
@@ -455,6 +483,7 @@ async function createWidget() {
           delayMinutes: raw.delayMinutes,
           canceled: raw.canceled,
           line: raw.line,
+          durationMinutes: raw.durationMinutes,
         });
       }
       addFooter(widget, null, `Saved data - ${err.message}`);
