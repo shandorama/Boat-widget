@@ -86,6 +86,7 @@ const CONFIG = {
   destinationStopName: "Köpstadsö",
   targetBoatCount: 4, // how many regular upcoming boats to show
   lastBoatCutoffHour: 4, // the last boat is the last one before this hour
+  maxNewTripChecksPerRun: 5, // see "Last boat of the night" below
   refreshMinutes: 10,
 };
 ```
@@ -122,9 +123,23 @@ tonight's last boat is still hours off).
 Finding it means paging forward through departures and checking each
 boat's Trip Details, which is too slow to redo on every ~10-minute widget
 refresh (this is what caused timeouts on the actual home screen widget
-before). So the result is cached and only actually re-searched once the
-previously-found last boat has passed — normally about once per night,
-not every refresh.
+before). Two layers guard against that:
+
+1. The result is cached and reused until the previously-found last boat
+   has actually passed, so the search only needs to happen roughly once
+   per night, not every refresh.
+2. Every day's boats get entirely new trip ids (yesterday's cache never
+   carries over), so even that once-a-night search can be a "cold start"
+   covering many hours. `maxNewTripChecksPerRun` caps how many *brand-new*
+   Trip Details lookups a single widget refresh is willing to make; if the
+   search doesn't finish within that budget it just doesn't show a 5th row
+   for that refresh, rather than guessing. The boats it did check are
+   still cached, so the next refresh has that much less new work left —
+   the search completes (and the row appears) within a few refreshes
+   rather than risking a timeout trying to finish in one. This cap only
+   applies to the actual home screen widget; a manual ▶️ Play run in the
+   app has proven to have a much looser time budget, so it always
+   completes the search in one go.
 
 To see more than the widget's on-screen rows, run the script manually in
 Scriptable (▶️ Play) — it prints the full list to the console log and
