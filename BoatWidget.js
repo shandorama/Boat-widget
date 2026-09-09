@@ -112,7 +112,18 @@ async function getApiKey() {
 
 // ---------- networking ----------
 
-async function fetchJSON(url) {
+function delay(ms) {
+  return new Promise((resolve) => Timer.schedule(ms, false, resolve));
+}
+
+// Two widgets (this one and its return-trip sibling) share one API key and
+// can refresh at close to the same moment, which can trip the free tier's
+// rate limit. Retry a rate-limited or transiently-failing request a few
+// times with backoff before giving up, and add a touch of random jitter
+// before it (see main()) so both widgets are less likely to collide in the
+// first place.
+async function fetchJSON(url, attempt) {
+  attempt = attempt || 1;
   const req = new Request(url);
   const text = await req.loadString();
   const status = req.response ? req.response.statusCode : null;
@@ -124,6 +135,11 @@ async function fetchJSON(url) {
   }
   if (status && status >= 400) {
     const msg = (json && (json.message || json.error)) || text || `HTTP ${status}`;
+    const retryable = status === 429 || status >= 500;
+    if (retryable && attempt < 4) {
+      await delay(attempt * 1500);
+      return fetchJSON(url, attempt + 1);
+    }
     throw new Error(`API error ${status}: ${msg}`);
   }
   if (json === null) {
@@ -270,7 +286,12 @@ async function collectUpcomingBoats(apiKey, stopId) {
       if (!config.runsInWidget) {
         console.log(`Stopped paging (page ${page}, time ${timeParam || "now"}): ${err.message}`);
       }
-      break; // keep whatever boats earlier pages already found
+      // A failed request is not the same thing as "no boats" - if we have
+      // nothing yet, let the failure propagate so the caller falls back to
+      // cached data (or shows a real error) instead of wrongly reporting
+      // an empty schedule. If earlier pages already found boats, keep them.
+      if (!results.length) throw err;
+      break;
     }
 
     if (raw.length) {
@@ -389,6 +410,14 @@ async function createWidget() {
       );
       widget.refreshAfterDate = new Date(Date.now() + CONFIG.refreshMinutes * 60 * 1000);
       return widget;
+    }
+
+    if (config.runsInWidget) {
+      // This script and its return-trip sibling share one API key and can
+      // both be scheduled to refresh at close to the same moment; a small
+      // random delay spreads their requests out so they're less likely to
+      // collide and trip the free tier's rate limit.
+      await delay(Math.floor(Math.random() * 4000));
     }
 
     let stopId = readCache().stopId;
