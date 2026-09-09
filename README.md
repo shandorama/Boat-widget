@@ -39,6 +39,25 @@ Scriptable-style widget, which is what this is.
    [`BoatWidgetReturn.js`](./BoatWidgetReturn.js). It reuses the same
    Trafiklab API key from the Keychain, so you won't be asked for it again.
 
+That's the only manual copy-paste you should ever need — see "Self-updating"
+below.
+
+## Self-updating
+
+Each script fetches its own latest version from this repo's `main` branch
+on every run and overwrites itself on disk if it's changed (see
+`selfUpdate()` at the top of either file). So once you've done the setup
+above, any future fix pushed to this repo reaches your phone automatically
+within one widget refresh (~10 minutes) — no more copy-pasting.
+
+A failed update check (offline, GitHub unreachable) is silently ignored and
+the widget keeps running whatever version it already has, so it never
+blocks the widget from showing boat times.
+
+If you ever want to stop this (e.g. to hand-edit the script yourself
+without it being overwritten), delete or comment out the `await
+selfUpdate();` line near the bottom of the file, in `main()`.
+
 ## Changing the route
 
 Edit the `CONFIG` block at the top of either file:

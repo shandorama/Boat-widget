@@ -26,6 +26,11 @@
  * a second Scriptable script and swap originStopName/destinationStopName
  * in CONFIG below.
  *
+ * Self-updating: every run fetches this same file fresh from GitHub
+ * (SELF_UPDATE_URL below) and overwrites itself on disk if it changed, so
+ * a fix pushed there reaches your phone on the next refresh with no more
+ * manual copy-pasting. See selfUpdate() for details.
+ *
  * First-time setup:
  *   1. Install "Scriptable" from the App Store.
  *   2. Create a new script, paste this whole file in, name it "BoatWidget".
@@ -50,6 +55,7 @@ const CONFIG = {
 const KEYCHAIN_KEY = "boatWidgetTrafiklabApiKey";
 const CACHE_FILE_NAME = `boat-widget-cache-${slug(CONFIG.originStopName)}-${slug(CONFIG.destinationStopName)}.json`;
 const API_BASE = "https://realtime-api.trafiklab.se/v1";
+const SELF_UPDATE_URL = "https://raw.githubusercontent.com/shandorama/Boat-widget/main/BoatWidget.js";
 
 function slug(name) {
   return name
@@ -82,6 +88,35 @@ function writeCache(partial) {
   const current = readCache();
   const next = Object.assign({}, current, partial);
   fm.writeString(cachePath(), JSON.stringify(next));
+}
+
+// ---------- self-update ----------
+// Pulls this script's own latest version from GitHub and overwrites the
+// local copy on disk, so a fix pushed there reaches your phone on the next
+// run without you needing to copy-paste again. This run keeps using the
+// code already loaded in memory - only the *next* run picks up the
+// change, which is fine since the widget refreshes every ~10 minutes
+// anyway. Failures (offline, GitHub down, etc.) are silently ignored so
+// they never block the widget from showing boat times with what it has.
+async function selfUpdate() {
+  try {
+    const req = new Request(SELF_UPDATE_URL);
+    const latest = await req.loadString();
+    const status = req.response ? req.response.statusCode : null;
+    if (status !== 200 || !latest.startsWith("// Variables used by Scriptable.")) {
+      return; // don't trust anything that doesn't look like this script
+    }
+    // Scripts can live in Scriptable's local storage or in iCloud - match
+    // whichever one actually holds this file.
+    const icloud = FileManager.iCloud();
+    const fm = icloud.fileExists(module.filename) ? icloud : FileManager.local();
+    const current = fm.readString(module.filename);
+    if (latest !== current) {
+      fm.writeString(module.filename, latest);
+    }
+  } catch (e) {
+    // Offline or GitHub unreachable - keep running the current version.
+  }
 }
 
 // ---------- API key ----------
@@ -476,6 +511,7 @@ async function createWidget() {
 }
 
 async function main() {
+  await selfUpdate();
   const widget = await createWidget();
   if (config.runsInWidget) {
     Script.setWidget(widget);
