@@ -104,6 +104,11 @@ trip's result is cached locally per direction (a trip's own stop pattern
 never changes once scheduled, so this is safe), so a boat already seen on
 a previous refresh isn't re-checked every 10 minutes.
 
+That same Trip Details call also already contains the arrival time at the
+destination, so each row also shows the **travel time** (e.g. "Line 282 ·
+15 min") at no extra API cost - it's read from data already being fetched
+to verify direction, not a separate lookup.
+
 Every network request has a short timeout (4s) and at most one quick
 retry, and a single failing trip check is skipped (that boat just isn't
 included this refresh, and gets rechecked fresh next time) rather than
