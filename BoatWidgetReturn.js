@@ -6,8 +6,9 @@
  *
  * This is the mirror image of BoatWidget.js (Saltholmen -> Köpstadsö) with
  * originStopName/destinationStopName swapped - see that file for the full
- * explanation of how route-matching works. Keep both files in sync if you
- * change the matching logic; this one is otherwise byte-for-byte the same.
+ * explanation of how route-matching and the last-boat row work. Keep both
+ * files in sync if you change the matching logic; this one is otherwise
+ * byte-for-byte the same.
  *
  * Data source: Trafiklab Realtime API (covers Västtrafik / Styrsöbolaget
  * archipelago ferries). Get a free API key at https://www.trafiklab.se/
@@ -33,7 +34,9 @@
 const CONFIG = {
   originStopName: "Köpstadsö",
   destinationStopName: "Saltholmen",
-  targetBoatCount: 5, // how many upcoming boats to look for
+  targetBoatCount: 4, // how many regular upcoming boats to show
+  lastBoatGapMinutes: 90, // a gap at least this long marks the overnight break
+  lastBoatSearchCount: 25, // how many boats ahead to look at when finding it
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
   tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
@@ -295,12 +298,12 @@ async function tripServesRoute(apiKey, tripId, startDate) {
   return serves;
 }
 
-async function collectUpcomingBoats(apiKey, stopId) {
+async function collectUpcomingBoats(apiKey, stopId, count) {
   const results = [];
   const seenTripIds = new Set();
   let cursor = null; // Date to page into the next 60-minute window
 
-  for (let page = 0; page < CONFIG.maxLookaheadPages && results.length < CONFIG.targetBoatCount; page++) {
+  for (let page = 0; page < CONFIG.maxLookaheadPages && results.length < count; page++) {
     const timeParam = cursor ? formatApiTime(cursor) : undefined;
     let raw;
     try {
@@ -351,7 +354,37 @@ async function collectUpcomingBoats(apiKey, stopId) {
   }
 
   results.sort((a, b) => a.time.getTime() - b.time.getTime());
-  return results.slice(0, CONFIG.targetBoatCount);
+  return results.slice(0, count);
+}
+
+// The archipelago boats run frequently all day and then stop for a few
+// hours overnight before the first morning departure. The boat right
+// before that gap is the last one you can catch home for the night - find
+// it by walking the (chronologically sorted) upcoming boats and returning
+// the one right before the first gap that's at least lastBoatGapMinutes
+// long. Returns null if no such gap shows up within the fetched boats.
+function findLastBoatBeforeGap(sortedBoats) {
+  for (let i = 0; i < sortedBoats.length - 1; i++) {
+    const gapMinutes = (sortedBoats[i + 1].time.getTime() - sortedBoats[i].time.getTime()) / 60000;
+    if (gapMinutes >= CONFIG.lastBoatGapMinutes) {
+      return sortedBoats[i];
+    }
+  }
+  return null;
+}
+
+// Builds the final 4-regular + 1-last-boat display list from a single
+// fetch, so the "last boat of the night" row can be found even when it's
+// well beyond the next 4 regular departures (e.g. it's currently
+// afternoon and tonight's last boat is hours away).
+function buildDisplayList(allBoats) {
+  const lastBoat = findLastBoatBeforeGap(allBoats);
+  const regular = (lastBoat ? allBoats.filter((b) => b.tripId !== lastBoat.tripId) : allBoats).slice(
+    0,
+    CONFIG.targetBoatCount
+  );
+  if (!lastBoat) return regular;
+  return [...regular, Object.assign({}, lastBoat, { isLastBoat: true })];
 }
 
 // ---------- widget rendering ----------
@@ -370,12 +403,15 @@ function addHeader(widget) {
 }
 
 function addDepartureRow(widget, dep) {
+  if (dep.isLastBoat) widget.addSpacer(8); // set it apart from the regular rows above
+
   const row = widget.addStack();
   row.centerAlignContent();
+  const accentColor = dep.isLastBoat ? new Color("#bf5af2") : Color.white();
 
   const time = row.addText(timeLabel(dep.time));
   time.font = Font.semiboldSystemFont(20);
-  time.textColor = Color.white();
+  time.textColor = accentColor;
 
   row.addSpacer(8);
 
@@ -393,9 +429,10 @@ function addDepartureRow(widget, dep) {
   status.textColor = statusColor;
 
   row.addSpacer();
-  const line = row.addText(`Line ${dep.line}`);
+  const lineLabel = dep.isLastBoat ? `🌙 Last · Line ${dep.line}` : `Line ${dep.line}`;
+  const line = row.addText(lineLabel);
   line.font = Font.systemFont(13);
-  line.textColor = new Color("#8e8e93");
+  line.textColor = dep.isLastBoat ? accentColor : new Color("#8e8e93");
 
   widget.addSpacer(4);
 }
@@ -420,7 +457,8 @@ async function createWidget() {
   widget.setPadding(12, 12, 12, 12);
 
   const family = config.widgetFamily || (config.runsInWidget ? "medium" : "large");
-  const maxResults = { small: 1, medium: 4, large: CONFIG.targetBoatCount }[family] || 4;
+  const totalRows = CONFIG.targetBoatCount + 1; // regular boats + the last-boat row
+  const maxResults = family === "small" ? 1 : totalRows;
 
   addHeader(widget);
 
@@ -452,30 +490,37 @@ async function createWidget() {
       throw new Error(`Could not find stop "${CONFIG.originStopName}"`);
     }
 
-    const boats = await collectUpcomingBoats(apiKey, stopId);
+    const boats = await collectUpcomingBoats(apiKey, stopId, CONFIG.lastBoatSearchCount);
 
     if (!boats.length) {
       addMessage(widget, `No boats to ${CONFIG.destinationStopName} found in the lookahead window.`);
     } else {
-      for (const dep of boats.slice(0, maxResults)) addDepartureRow(widget, dep);
+      const displayList = buildDisplayList(boats);
+      for (const dep of displayList.slice(0, maxResults)) addDepartureRow(widget, dep);
       writeCache({
-        lastDepartures: boats.map((d) => ({
+        lastDepartures: displayList.map((d) => ({
           time: d.time.toISOString(),
           delayMinutes: d.delayMinutes,
           canceled: d.canceled,
           line: d.line,
+          isLastBoat: !!d.isLastBoat,
         })),
         lastUpdated: new Date().toISOString(),
       });
+
+      if (!config.runsInWidget) {
+        console.log(
+          `Showing to ${CONFIG.destinationStopName}: ` +
+            displayList
+              .map(
+                (b) =>
+                  `${timeLabel(b.time)}${b.delayMinutes ? ` (+${b.delayMinutes}m)` : ""}${b.isLastBoat ? " [last boat]" : ""}`
+              )
+              .join(", ")
+        );
+      }
     }
     addFooter(widget, new Date());
-
-    if (!config.runsInWidget) {
-      console.log(
-        `Next ${boats.length} boat(s) to ${CONFIG.destinationStopName}: ` +
-          boats.map((b) => `${timeLabel(b.time)}${b.delayMinutes ? ` (+${b.delayMinutes}m)` : ""}`).join(", ")
-      );
-    }
   } catch (err) {
     const cache = readCache();
     const cached = cache.lastDepartures || [];
@@ -486,6 +531,7 @@ async function createWidget() {
           delayMinutes: raw.delayMinutes,
           canceled: raw.canceled,
           line: raw.line,
+          isLastBoat: !!raw.isLastBoat,
         });
       }
       addFooter(widget, null, `Saved data - ${err.message}`);

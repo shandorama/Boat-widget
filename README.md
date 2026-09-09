@@ -66,7 +66,9 @@ Edit the `CONFIG` block at the top of either file:
 const CONFIG = {
   originStopName: "Saltholmen",
   destinationStopName: "Köpstadsö",
-  targetBoatCount: 5, // how many upcoming boats to look for
+  targetBoatCount: 4, // how many regular upcoming boats to show
+  lastBoatGapMinutes: 90, // a gap at least this long marks the overnight break
+  lastBoatSearchCount: 25, // how many boats ahead to look at when finding it
   refreshMinutes: 10,
 };
 ```
@@ -86,14 +88,25 @@ trip's result is cached locally per direction (a trip's own stop pattern
 never changes once scheduled, so this is safe), so a boat already seen on
 a previous refresh isn't re-checked every 10 minutes.
 
-The search for `targetBoatCount` upcoming boats pages forward through
-60-minute windows and keeps going across any overnight service gap into
-the next day, so you'll always get that many boats rather than "however
-many are left today".
+## Last boat of the night
+
+The widget shows the next `targetBoatCount` (4) regular boats, plus a 5th
+row in a different color (purple, with a 🌙) for the **last boat before
+the overnight service gap** — handy if you're out late and need to know
+your last ride home.
+
+It's found by fetching up to `lastBoatSearchCount` (25) boats ahead and
+walking through them in order to find the first gap between two
+consecutive boats that's at least `lastBoatGapMinutes` (90) long — the
+boat right before that gap is the last one before the archipelago boats
+stop for the night (typically resuming around 04:30–05:47). That boat is
+pulled out of the regular list and always shown as the 5th row, even if
+it's hours away from the next 4 departures shown above it (e.g. it's
+currently mid-afternoon and tonight's last boat is still hours off).
 
 To see more than the widget's on-screen rows, run the script manually in
-Scriptable (▶️ Play) — it prints the next `targetBoatCount` departures to
-the console log and shows a larger in-app preview.
+Scriptable (▶️ Play) — it prints the full list to the console log and
+shows a larger in-app preview.
 
 ## Notes & limitations
 
