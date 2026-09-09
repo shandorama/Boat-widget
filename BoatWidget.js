@@ -60,7 +60,8 @@ async function ensureLatestCore() {
 async function main() {
   try {
     await ensureLatestCore();
-    await importModule(CORE_NAME);
+    const runCore = importModule(CORE_NAME); // synchronous - returns the exported main()
+    await runCore();
   } catch (e) {
     // Something about the loader itself failed (not just a boat-data
     // fetch, which BoatWidgetCore.js already handles on its own) - show a

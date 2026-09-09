@@ -510,4 +510,7 @@ async function main() {
   Script.complete();
 }
 
-await main();
+// Scriptable's importModule() is synchronous and can't handle a module
+// that runs a top-level `await` itself - exporting main() and letting the
+// loader call and await it avoids that entirely.
+module.exports = main;
