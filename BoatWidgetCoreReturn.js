@@ -9,9 +9,9 @@
  *
  * This is the mirror image of BoatWidgetCore.js (Saltholmen -> Köpstadsö)
  * with originStopName/destinationStopName swapped below - see that file
- * for the full explanation of how route-matching and the last-boat row
- * work. Keep both files in sync if you change the matching logic; this
- * one is otherwise byte-for-byte the same.
+ * for the full explanation of how route-matching works. Keep both files
+ * in sync if you change the matching logic; this one is otherwise
+ * byte-for-byte the same.
  *
  * Data source: Trafiklab Realtime API (covers Västtrafik / Styrsöbolaget
  * archipelago ferries). Get a free API key at https://www.trafiklab.se/
@@ -20,10 +20,7 @@
 const CONFIG = {
   originStopName: "Köpstadsö",
   destinationStopName: "Saltholmen",
-  targetBoatCount: 4, // how many regular upcoming boats to show
-  lastBoatCutoffHour: 4, // the last boat is the last one before this hour
-  maxNewTripChecksPerRun: 5, // cap on *uncached* Trip Details lookups per
-  // widget refresh when searching for the last boat - see getLastBoat()
+  targetBoatCount: 5, // how many upcoming boats to show
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
   tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
@@ -99,17 +96,11 @@ function delay(ms) {
   return new Promise((resolve) => Timer.schedule(ms, false, resolve));
 }
 
-// Two widgets (this one and its return-trip sibling) share one API key and
-// can refresh at close to the same moment, which can trip the free tier's
-// rate limit. Retry a rate-limited or transiently-failing request once
-// with a short backoff before giving up, and add a touch of random jitter
-// before it (see main()) so both widgets are less likely to collide in the
-// first place. iOS gives home screen widgets a strict time budget to
-// finish in, and a weak connection makes every individual request slow,
-// so every request gets a short timeout and at most one quick retry - a
-// fast failure that falls back to cached data (or, for an individual
-// trip check, is simply skipped for this run - see collectMatchingBoats)
-// beats a slow one that eats the whole time budget or hangs the app.
+// Retry a rate-limited or transiently-failing request once with a short
+// backoff before giving up, and keep the timeout short - a weak
+// connection makes every individual request slow, so a fast failure
+// (falling back to cached data, or for an individual trip check, just
+// skipping that boat - see collectUpcomingBoats) beats a slow one.
 async function fetchJSON(url, attempt) {
   attempt = attempt || 1;
   const req = new Request(url);
@@ -261,32 +252,12 @@ async function tripServesRoute(apiKey, tripId, startDate) {
   return serves;
 }
 
-// Shared pagination: walks forward through 60-minute departure windows,
-// verifying each BOAT departure's actual route via tripServesRoute(), and
-// stops as soon as shouldStop(results, cursor) says so. shouldCollect(boat)
-// decides whether a verified boat is kept in the results. Used both for
-// "the next few boats" (stop once we have enough) and "the last boat
-// before 04:00" (stop once we've paged past that time) below.
-//
-// maxNewTripChecks caps how many *not-yet-cached* Trip Details lookups
-// this call is willing to make - each trip is checked once per day (every
-// day's boats get fresh trip ids, so yesterday's cache never carries
-// over), and a cold search covering many hours could need enough of them
-// to blow past a widget's strict execution time budget on its own. When
-// the cap is hit, the search stops early and reports itself incomplete;
-// the boats it did verify are still cached via tripServesRoute() though,
-// so a follow-up call (the next refresh) picks up further ahead with that
-// much less new work left to do - the search completes over a few
-// refreshes instead of risking a timeout trying to finish in one.
-async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect, maxNewTripChecks }) {
+async function collectUpcomingBoats(apiKey, stopId, count) {
   const results = [];
   const seenTripIds = new Set();
-  const knowledge = readTripKnowledge();
   let cursor = null; // Date to page into the next 60-minute window
-  let newChecks = 0;
-  let complete = true;
 
-  for (let page = 0; page < CONFIG.maxLookaheadPages && !shouldStop(results, cursor); page++) {
+  for (let page = 0; page < CONFIG.maxLookaheadPages && results.length < count; page++) {
     const timeParam = cursor ? formatApiTime(cursor) : undefined;
     let raw;
     try {
@@ -300,13 +271,10 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
       // cached data (or shows a real error) instead of wrongly reporting
       // an empty schedule. If earlier pages already found boats, keep them.
       if (!results.length) throw err;
-      complete = false;
       break;
     }
 
     if (raw.length) {
-      let hitBudget = false;
-      let hadFailure = false;
       for (const dep of raw) {
         const route = dep.route || {};
         if (route.transport_mode !== "BOAT") continue;
@@ -319,17 +287,10 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
         }
         if (!tripId || !startDate) continue;
 
-        const isCached = !!knowledge[tripCacheKey(tripId, startDate)];
-        if (!isCached && maxNewTripChecks != null && newChecks >= maxNewTripChecks) {
-          hitBudget = true;
-          continue; // skip further *new* checks this run, but keep collecting cache hits
-        }
-        if (!isCached) newChecks++;
-
-        // A weak connection can make any single check slow or fail outright
-        // (timeout, dropped connection). One flaky trip shouldn't abort the
-        // whole search - skip it for this run (uncached, so a later
-        // refresh retries it fresh) rather than throwing.
+        // A weak connection can make any single check slow or fail
+        // outright. One flaky trip shouldn't abort the whole search - skip
+        // it for this run (uncached, so a later refresh retries it fresh)
+        // rather than throwing.
         let serves;
         try {
           serves = await tripServesRoute(apiKey, tripId, startDate);
@@ -337,24 +298,18 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
           if (!config.runsInWidget) {
             console.log(`Skipped trip ${tripId} (check failed): ${err.message}`);
           }
-          hadFailure = true;
           continue;
         }
         if (!serves) continue;
 
-        const boat = toBoat(dep);
-        if (shouldCollect(boat)) results.push(boat);
-      }
-      if (hadFailure) complete = false;
-      if (hitBudget) {
-        complete = false;
-        break;
+        results.push(toBoat(dep));
       }
     }
 
     // Advance to the next 60-minute window regardless of whether this one
     // had any departures at all, so an overnight service gap (e.g. no
-    // boats/trams/buses for a few hours) doesn't stop the search early.
+    // boats/trams/buses for a few hours) doesn't stop the search early -
+    // we want the next N boats "regardless of end of day".
     const lastRaw = raw[raw.length - 1];
     const lastScheduled = lastRaw ? new Date(lastRaw.scheduled) : null;
     const nextCursor =
@@ -365,113 +320,7 @@ async function collectMatchingBoats(apiKey, stopId, { shouldStop, shouldCollect,
   }
 
   results.sort((a, b) => a.time.getTime() - b.time.getTime());
-  return { results, complete };
-}
-
-async function collectNextBoats(apiKey, stopId, count) {
-  // Capped like the last-boat search below - a weak connection can make
-  // even this small fetch slow, and there's no reliable "manual runs have
-  // more headroom" assumption to lean on here either.
-  const { results } = await collectMatchingBoats(apiKey, stopId, {
-    shouldStop: (results) => results.length >= count,
-    shouldCollect: () => true,
-    maxNewTripChecks: CONFIG.maxNewTripChecksPerRun,
-  });
   return results.slice(0, count);
-}
-
-// Returns the next occurrence of `hour`:00 strictly after `from` - today's
-// if it hasn't happened yet, otherwise tomorrow's.
-function nextClockTime(from, hour) {
-  const next = new Date(from);
-  next.setHours(hour, 0, 0, 0);
-  if (next.getTime() <= from.getTime()) {
-    next.setDate(next.getDate() + 1);
-  }
-  return next;
-}
-
-// The archipelago boats run frequently all day, then stop for a few hours
-// overnight before the first morning departure (typically ~04:30-05:47).
-// The last one you can catch home for the night is simply the last
-// matching boat that departs before the next occurrence of
-// lastBoatCutoffHour (04:00) - so page forward only as far as that cutoff
-// and take the latest boat found before it.
-async function collectLastBoatBeforeCutoff(apiKey, stopId, cutoff, maxNewTripChecks) {
-  const { results, complete } = await collectMatchingBoats(apiKey, stopId, {
-    shouldStop: (results, cursor) => !!cursor && cursor.getTime() >= cutoff.getTime(),
-    shouldCollect: (boat) => boat.time.getTime() < cutoff.getTime(),
-    maxNewTripChecks,
-  });
-  return { found: results.length ? results[results.length - 1] : null, complete };
-}
-
-// Finding the last boat means checking several boats' Trip Details, which
-// is too slow to redo on every ~10-minute widget refresh (iOS gives
-// widgets a strict time budget, and doing this every refresh is what
-// caused timeouts). Two layers guard against that:
-//
-// 1. Once found, the result is cached and reused across refreshes until
-//    it's actually in the past - so the search only needs to happen
-//    roughly once per night, not every refresh.
-// 2. Each day's boats get entirely new trip ids (yesterday's cache never
-//    carries over), so even that once-a-night search can still be a cold
-//    start covering many hours. maxNewTripChecksPerRun caps how much new
-//    work a single run is willing to do; if the search doesn't finish
-//    within that budget, no (possibly-wrong, since incomplete) guess is
-//    cached or shown - the row is just omitted for this refresh. The
-//    trips that were checked are still cached via tripServesRoute()
-//    though, so the next refresh picks up with that much less new work
-//    left, and the search completes - and the row appears - within a few
-//    refreshes rather than risking a timeout trying to finish in one.
-async function getLastBoat(apiKey, stopId) {
-  const cached = readCache().lastBoat;
-  if (cached && new Date(cached.time).getTime() > Date.now()) {
-    return Object.assign({}, cached, { time: new Date(cached.time) });
-  }
-
-  const cutoff = nextClockTime(new Date(), CONFIG.lastBoatCutoffHour);
-  // Capped in both the widget and manual runs - a weak connection can make
-  // even a manual run painfully slow (or make individual checks fail
-  // outright), so there's no reliable extra headroom to assume there.
-  const { found, complete } = await collectLastBoatBeforeCutoff(
-    apiKey,
-    stopId,
-    cutoff,
-    CONFIG.maxNewTripChecksPerRun
-  );
-  if (!complete) {
-    if (!config.runsInWidget) {
-      console.log("Last-boat search incomplete this run (budget hit or a check failed) - will resume next refresh.");
-    }
-    return null;
-  }
-  if (found) {
-    writeCache({
-      lastBoat: {
-        time: found.time.toISOString(),
-        delayMinutes: found.delayMinutes,
-        canceled: found.canceled,
-        line: found.line,
-        tripId: found.tripId,
-      },
-    });
-  }
-  return found;
-}
-
-// Builds the final 4-regular + 1-last-boat display list. regularBoats
-// comes from a small, cheap fetch; lastBoat is looked up (and cached)
-// separately so it can be found even when it's well beyond those regular
-// departures (e.g. it's currently afternoon and tonight's last boat is
-// hours away) without needing a wide fetch on every refresh.
-function buildDisplayList(regularBoats, lastBoat) {
-  const regular = (lastBoat ? regularBoats.filter((b) => b.tripId !== lastBoat.tripId) : regularBoats).slice(
-    0,
-    CONFIG.targetBoatCount
-  );
-  if (!lastBoat) return regular;
-  return [...regular, Object.assign({}, lastBoat, { isLastBoat: true })];
 }
 
 // ---------- widget rendering ----------
@@ -490,15 +339,12 @@ function addHeader(widget) {
 }
 
 function addDepartureRow(widget, dep) {
-  if (dep.isLastBoat) widget.addSpacer(8); // set it apart from the regular rows above
-
   const row = widget.addStack();
   row.centerAlignContent();
-  const accentColor = dep.isLastBoat ? new Color("#bf5af2") : Color.white();
 
   const time = row.addText(timeLabel(dep.time));
   time.font = Font.semiboldSystemFont(20);
-  time.textColor = accentColor;
+  time.textColor = Color.white();
 
   row.addSpacer(8);
 
@@ -516,10 +362,9 @@ function addDepartureRow(widget, dep) {
   status.textColor = statusColor;
 
   row.addSpacer();
-  const lineLabel = dep.isLastBoat ? `🌙 Last · Line ${dep.line}` : `Line ${dep.line}`;
-  const line = row.addText(lineLabel);
+  const line = row.addText(`Line ${dep.line}`);
   line.font = Font.systemFont(13);
-  line.textColor = dep.isLastBoat ? accentColor : new Color("#8e8e93");
+  line.textColor = new Color("#8e8e93");
 
   widget.addSpacer(4);
 }
@@ -544,8 +389,7 @@ async function createWidget() {
   widget.setPadding(12, 12, 12, 12);
 
   const family = config.widgetFamily || (config.runsInWidget ? "medium" : "large");
-  const totalRows = CONFIG.targetBoatCount + 1; // regular boats + the last-boat row
-  const maxResults = family === "small" ? 1 : totalRows;
+  const maxResults = { small: 1, medium: 4, large: CONFIG.targetBoatCount }[family] || 4;
 
   addHeader(widget);
 
@@ -564,8 +408,7 @@ async function createWidget() {
       // This script and its return-trip sibling share one API key and can
       // both be scheduled to refresh at close to the same moment; a small
       // random delay spreads their requests out so they're less likely to
-      // collide and trip the free tier's rate limit. Kept short - widgets
-      // have a strict overall time budget.
+      // collide and trip the free tier's rate limit.
       await delay(Math.floor(Math.random() * 1200));
     }
 
@@ -578,40 +421,26 @@ async function createWidget() {
       throw new Error(`Could not find stop "${CONFIG.originStopName}"`);
     }
 
-    // Two separate lookups: a small, cheap one for the regular upcoming
-    // boats (every refresh), and the last-boat-of-the-night one, which is
-    // far more expensive but internally cached and normally only actually
-    // searches once per night - see getLastBoat().
-    const [regularBoats, lastBoat] = await Promise.all([
-      collectNextBoats(apiKey, stopId, CONFIG.targetBoatCount + 2),
-      getLastBoat(apiKey, stopId),
-    ]);
+    const boats = await collectUpcomingBoats(apiKey, stopId, CONFIG.targetBoatCount);
 
-    if (!regularBoats.length && !lastBoat) {
+    if (!boats.length) {
       addMessage(widget, `No boats to ${CONFIG.destinationStopName} found in the lookahead window.`);
     } else {
-      const displayList = buildDisplayList(regularBoats, lastBoat);
-      for (const dep of displayList.slice(0, maxResults)) addDepartureRow(widget, dep);
+      for (const dep of boats.slice(0, maxResults)) addDepartureRow(widget, dep);
       writeCache({
-        lastDepartures: displayList.map((d) => ({
+        lastDepartures: boats.map((d) => ({
           time: d.time.toISOString(),
           delayMinutes: d.delayMinutes,
           canceled: d.canceled,
           line: d.line,
-          isLastBoat: !!d.isLastBoat,
         })),
         lastUpdated: new Date().toISOString(),
       });
 
       if (!config.runsInWidget) {
         console.log(
-          `Showing to ${CONFIG.destinationStopName}: ` +
-            displayList
-              .map(
-                (b) =>
-                  `${timeLabel(b.time)}${b.delayMinutes ? ` (+${b.delayMinutes}m)` : ""}${b.isLastBoat ? " [last boat]" : ""}`
-              )
-              .join(", ")
+          `Next ${boats.length} boat(s) to ${CONFIG.destinationStopName}: ` +
+            boats.map((b) => `${timeLabel(b.time)}${b.delayMinutes ? ` (+${b.delayMinutes}m)` : ""}`).join(", ")
         );
       }
     }
@@ -626,7 +455,6 @@ async function createWidget() {
           delayMinutes: raw.delayMinutes,
           canceled: raw.canceled,
           line: raw.line,
-          isLastBoat: !!raw.isLastBoat,
         });
       }
       addFooter(widget, null, `Saved data - ${err.message}`);

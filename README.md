@@ -84,9 +84,7 @@ Edit the `CONFIG` block at the top of either *core* file (`BoatWidgetCore.js`
 const CONFIG = {
   originStopName: "Saltholmen",
   destinationStopName: "Köpstadsö",
-  targetBoatCount: 4, // how many regular upcoming boats to show
-  lastBoatCutoffHour: 4, // the last boat is the last one before this hour
-  maxNewTripChecksPerRun: 5, // see "Last boat of the night" below
+  targetBoatCount: 5, // how many upcoming boats to show
   refreshMinutes: 10,
 };
 ```
@@ -106,48 +104,22 @@ trip's result is cached locally per direction (a trip's own stop pattern
 never changes once scheduled, so this is safe), so a boat already seen on
 a previous refresh isn't re-checked every 10 minutes.
 
-## Last boat of the night
-
-The widget shows the next `targetBoatCount` (4) regular boats, plus a 5th
-row in a different color (purple, with a 🌙) for the **last boat before
-the overnight service gap** — handy if you're out late and need to know
-your last ride home.
-
-It's simply the last matching boat departing before `lastBoatCutoffHour`
-(04:00) — the archipelago boats stop for the night at some point before
-then and resume around 04:30–05:47. That boat is pulled out of the regular
-list and always shown as the 5th row, even if it's hours away from the
-next 4 departures shown above it (e.g. it's currently mid-afternoon and
-tonight's last boat is still hours off).
-
-Finding it means paging forward through departures and checking each
-boat's Trip Details, which is too slow to redo on every ~10-minute widget
-refresh (this, plus a slow/unreliable connection making every request
-take longer, is what caused timeouts on the actual home screen widget -
-and even made manual test runs appear to hang with nothing showing).
-Several layers guard against that:
-
-1. The result is cached and reused until the previously-found last boat
-   has actually passed, so the search only needs to happen roughly once
-   per night, not every refresh.
-2. Every day's boats get entirely new trip ids (yesterday's cache never
-   carries over), so even that once-a-night search can be a "cold start"
-   covering many hours. `maxNewTripChecksPerRun` caps how many *brand-new*
-   Trip Details lookups a single run (widget **or** manual - a weak
-   connection can make either slow) is willing to make; if the search
-   doesn't finish within that budget it just doesn't show a 5th row for
-   that run, rather than guessing. The boats it did check are still
-   cached, so the next run has that much less new work left - the search
-   completes (and the row appears) within a few refreshes rather than
-   risking a timeout trying to finish in one.
-3. Every network request has a short timeout (4s) and at most one quick
-   retry, and a single failing trip check is skipped rather than aborting
-   the whole search - a slow/flaky connection degrades to "fewer boats
-   checked this run" instead of hanging or crashing.
+Every network request has a short timeout (4s) and at most one quick
+retry, and a single failing trip check is skipped (that boat just isn't
+included this refresh, and gets rechecked fresh next time) rather than
+aborting the whole search - a slow/flaky connection degrades to "fewer
+boats checked this run" instead of hanging or crashing.
 
 To see more than the widget's on-screen rows, run the script manually in
 Scriptable (▶️ Play) — it prints the full list to the console log and
 shows a larger in-app preview.
+
+There used to also be a 5th row highlighting the last boat before the
+overnight service gap. It was removed - finding it required checking many
+boats' Trip Details each time the cache expired, which pushed real usage
+noticeably closer to Trafiklab's API quota. If you want it back, an
+earlier version of this README/these files had it; it's straightforward
+to re-add but costs meaningfully more API calls.
 
 ## Notes & limitations
 
