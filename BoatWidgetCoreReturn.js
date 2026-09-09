@@ -22,7 +22,10 @@ const CONFIG = {
   destinationStopName: "Saltholmen",
   targetBoatCount: 4, // how many regular upcoming boats to show
   lastBoatGapMinutes: 90, // a gap at least this long marks the overnight break
-  lastBoatSearchCount: 25, // how many boats ahead to look at when finding it
+  lastBoatSearchCount: 15, // how many boats ahead to look at when finding it -
+  // kept modest since this runs its full search roughly once per night now
+  // (see getLastBoat()), but still costs several Trip Details calls on
+  // that one run and widgets have a strict time budget
   maxLookaheadPages: 36, // safety cap: up to ~36 hours of 60-minute windows,
   // enough to page straight through an overnight gap into the next day.
   tripKnowledgeMaxAgeDays: 3, // discard cached per-trip results older than this
@@ -100,13 +103,17 @@ function delay(ms) {
 
 // Two widgets (this one and its return-trip sibling) share one API key and
 // can refresh at close to the same moment, which can trip the free tier's
-// rate limit. Retry a rate-limited or transiently-failing request a few
-// times with backoff before giving up, and add a touch of random jitter
+// rate limit. Retry a rate-limited or transiently-failing request once
+// with a short backoff before giving up, and add a touch of random jitter
 // before it (see main()) so both widgets are less likely to collide in the
-// first place.
+// first place. iOS gives home screen widgets a strict time budget to
+// finish in, so every request also gets a short timeout and retries are
+// kept few and short rather than thorough - a fast failure that falls
+// back to cached data beats a slow one that gets the whole widget killed.
 async function fetchJSON(url, attempt) {
   attempt = attempt || 1;
   const req = new Request(url);
+  req.timeoutInterval = 8;
   const text = await req.loadString();
   const status = req.response ? req.response.statusCode : null;
   let json = null;
@@ -118,8 +125,8 @@ async function fetchJSON(url, attempt) {
   if (status && status >= 400) {
     const msg = (json && (json.message || json.error)) || text || `HTTP ${status}`;
     const retryable = status === 429 || status >= 500;
-    if (retryable && attempt < 4) {
-      await delay(attempt * 1500);
+    if (retryable && attempt < 2) {
+      await delay(attempt * 800);
       return fetchJSON(url, attempt + 1);
     }
     throw new Error(`API error ${status}: ${msg}`);
@@ -329,13 +336,41 @@ function findLastBoatBeforeGap(sortedBoats) {
   return null;
 }
 
-// Builds the final 4-regular + 1-last-boat display list from a single
-// fetch, so the "last boat of the night" row can be found even when it's
-// well beyond the next 4 regular departures (e.g. it's currently
-// afternoon and tonight's last boat is hours away).
-function buildDisplayList(allBoats) {
-  const lastBoat = findLastBoatBeforeGap(allBoats);
-  const regular = (lastBoat ? allBoats.filter((b) => b.tripId !== lastBoat.tripId) : allBoats).slice(
+// Finding the last boat means checking many boats' Trip Details, which is
+// too slow to redo on every ~10-minute widget refresh (iOS gives widgets a
+// strict time budget, and doing this every refresh is what caused
+// timeouts). Instead, cache the identified last boat and reuse it across
+// refreshes until it's actually in the past - so the expensive wide search
+// only runs roughly once per night, not every refresh.
+async function getLastBoat(apiKey, stopId) {
+  const cached = readCache().lastBoat;
+  if (cached && new Date(cached.time).getTime() > Date.now()) {
+    return Object.assign({}, cached, { time: new Date(cached.time) });
+  }
+
+  const wideBoats = await collectUpcomingBoats(apiKey, stopId, CONFIG.lastBoatSearchCount);
+  const found = findLastBoatBeforeGap(wideBoats);
+  if (found) {
+    writeCache({
+      lastBoat: {
+        time: found.time.toISOString(),
+        delayMinutes: found.delayMinutes,
+        canceled: found.canceled,
+        line: found.line,
+        tripId: found.tripId,
+      },
+    });
+  }
+  return found;
+}
+
+// Builds the final 4-regular + 1-last-boat display list. regularBoats
+// comes from a small, cheap fetch; lastBoat is looked up (and cached)
+// separately so it can be found even when it's well beyond those regular
+// departures (e.g. it's currently afternoon and tonight's last boat is
+// hours away) without needing a wide fetch on every refresh.
+function buildDisplayList(regularBoats, lastBoat) {
+  const regular = (lastBoat ? regularBoats.filter((b) => b.tripId !== lastBoat.tripId) : regularBoats).slice(
     0,
     CONFIG.targetBoatCount
   );
@@ -433,8 +468,9 @@ async function createWidget() {
       // This script and its return-trip sibling share one API key and can
       // both be scheduled to refresh at close to the same moment; a small
       // random delay spreads their requests out so they're less likely to
-      // collide and trip the free tier's rate limit.
-      await delay(Math.floor(Math.random() * 4000));
+      // collide and trip the free tier's rate limit. Kept short - widgets
+      // have a strict overall time budget.
+      await delay(Math.floor(Math.random() * 1200));
     }
 
     let stopId = readCache().stopId;
@@ -446,12 +482,19 @@ async function createWidget() {
       throw new Error(`Could not find stop "${CONFIG.originStopName}"`);
     }
 
-    const boats = await collectUpcomingBoats(apiKey, stopId, CONFIG.lastBoatSearchCount);
+    // Two separate lookups: a small, cheap one for the regular upcoming
+    // boats (every refresh), and the last-boat-of-the-night one, which is
+    // far more expensive but internally cached and normally only actually
+    // searches once per night - see getLastBoat().
+    const [regularBoats, lastBoat] = await Promise.all([
+      collectUpcomingBoats(apiKey, stopId, CONFIG.targetBoatCount + 2),
+      getLastBoat(apiKey, stopId),
+    ]);
 
-    if (!boats.length) {
+    if (!regularBoats.length && !lastBoat) {
       addMessage(widget, `No boats to ${CONFIG.destinationStopName} found in the lookahead window.`);
     } else {
-      const displayList = buildDisplayList(boats);
+      const displayList = buildDisplayList(regularBoats, lastBoat);
       for (const dep of displayList.slice(0, maxResults)) addDepartureRow(widget, dep);
       writeCache({
         lastDepartures: displayList.map((d) => ({

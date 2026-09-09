@@ -41,6 +41,7 @@ async function ensureLatestCore() {
   const path = corePath(fm);
   try {
     const req = new Request(CORE_URL);
+    req.timeoutInterval = 5; // widgets have a strict time budget - fail fast and use the cached core
     const latest = await req.loadString();
     const status = req.response ? req.response.statusCode : null;
     if (status === 200 && latest.startsWith(CORE_SIGNATURE)) {
