@@ -57,9 +57,15 @@ background widget refresh (~every 10 min) - each one:
 
 1. Downloads its actual logic (`BoatWidgetCore.js` / `BoatWidgetCoreReturn.js`)
    fresh from this repo's `main` branch.
-2. Saves it to a local file if it's changed.
-3. Runs that file immediately, in the *same* run - so a manual test run
-   shows a just-pushed fix right away, not "next time."
+2. Saves it to a local file named after a hash of its own content (e.g.
+   `BoatWidgetCore_a1b2c3.js`) if that exact version isn't already saved.
+3. Runs that file immediately, in the *same* run, via `importModule()` -
+   using that exact hashed name rather than one fixed name. Scriptable can
+   cache an imported module in memory by name for the life of the app
+   session, so reusing one fixed filename risked handing back a stale
+   in-memory copy even after a newer version was written to disk - a name
+   that changes whenever the content does can't collide with an older,
+   already-cached one.
 
 So once you've done the setup above, any future fix pushed to this repo
 reaches your phone and takes effect on your very next run/refresh — no
