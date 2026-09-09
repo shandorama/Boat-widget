@@ -4,8 +4,10 @@ Two iOS home screen widgets (via [Scriptable](https://scriptable.app)) showing
 live departure times for the archipelago boat between **Saltholmen** and
 **Köpstadsö**, one per direction, each refreshing roughly every 10 minutes:
 
-- **`BoatWidget.js`** — Saltholmen → Köpstadsö
-- **`BoatWidgetReturn.js`** — Köpstadsö → Saltholmen
+- **`BoatWidget.js`** — Saltholmen → Köpstadsö loader (paste this into Scriptable)
+- **`BoatWidgetCore.js`** — its actual logic, downloaded automatically - never paste this one in
+- **`BoatWidgetReturn.js`** — Köpstadsö → Saltholmen loader (paste this into Scriptable)
+- **`BoatWidgetCoreReturn.js`** — its actual logic, downloaded automatically - never paste this one in
 
 Both pull real-time data from the [Trafiklab Realtime API](https://www.trafiklab.se/api/our-apis/trafiklab-realtime-apis/),
 which covers Västtrafik / Styrsöbolaget ferries.
@@ -24,11 +26,13 @@ Scriptable-style widget, which is what this is.
 2. Install **[Scriptable](https://apps.apple.com/app/scriptable/id1405459188)**
    from the App Store (free).
 3. In Scriptable, tap **+** to create a new script, name it `BoatWidget`,
-   and paste in the contents of [`BoatWidget.js`](./BoatWidget.js).
+   and paste in the contents of [`BoatWidget.js`](./BoatWidget.js) — this
+   is a short "loader," not the full logic.
 4. Tap the **▶️ Play** button once to run it inside the app (not as a widget
    yet). It will:
+   - Download the actual logic (`BoatWidgetCore.js`) and run it immediately.
    - Ask for your Trafiklab API key and store it in the iOS Keychain (it is
-     never written into the script file).
+     never written into any script file).
    - Look up the Saltholmen stop id once and cache it locally.
    - Show a preview of the widget so you can confirm it's finding boats.
 5. Long-press your home screen → tap **+** → search **Scriptable** → add
@@ -40,27 +44,41 @@ Scriptable-style widget, which is what this is.
    Trafiklab API key from the Keychain, so you won't be asked for it again.
 
 That's the only manual copy-paste you should ever need — see "Self-updating"
-below.
+below. You may notice `BoatWidgetCore` / `BoatWidgetCoreReturn` show up as
+extra entries in Scriptable's own script list once downloaded — that's
+expected (they're just files Scriptable found), you can ignore them; the
+loaders are what you actually run or add as widgets.
 
 ## Self-updating
 
-Each script fetches its own latest version from this repo's `main` branch
-on every run and overwrites itself on disk if it's changed (see
-`selfUpdate()` at the top of either file). So once you've done the setup
-above, any future fix pushed to this repo reaches your phone automatically
-within one widget refresh (~10 minutes) — no more copy-pasting.
+`BoatWidget.js` and `BoatWidgetReturn.js` are thin "loaders" that rarely
+need to change. On every run - both a manual ▶️ Play and the automatic
+background widget refresh (~every 10 min) - each one:
 
-A failed update check (offline, GitHub unreachable) is silently ignored and
-the widget keeps running whatever version it already has, so it never
-blocks the widget from showing boat times.
+1. Downloads its actual logic (`BoatWidgetCore.js` / `BoatWidgetCoreReturn.js`)
+   fresh from this repo's `main` branch.
+2. Saves it to a local file if it's changed.
+3. Runs that file immediately, in the *same* run - so a manual test run
+   shows a just-pushed fix right away, not "next time."
 
-If you ever want to stop this (e.g. to hand-edit the script yourself
-without it being overwritten), delete or comment out the `await
-selfUpdate();` line near the bottom of the file, in `main()`.
+So once you've done the setup above, any future fix pushed to this repo
+reaches your phone and takes effect on your very next run/refresh — no
+more copy-pasting, and no need to run twice to see it apply.
+
+A failed download (offline, GitHub unreachable) falls back to whatever
+version was already downloaded before, so it never blocks the widget from
+showing boat times — only if there's *no* cached copy at all (e.g. the
+very first run with no connection) does it show a "Loader error" message.
+
+If you ever want to stop this (e.g. to hand-edit the logic yourself
+without it being overwritten), edit the *core* file directly rather than
+the loader, and remove or comment out `await ensureLatestCore();` in the
+loader so it stops re-downloading over your changes.
 
 ## Changing the route
 
-Edit the `CONFIG` block at the top of either file:
+Edit the `CONFIG` block at the top of either *core* file (`BoatWidgetCore.js`
+/ `BoatWidgetCoreReturn.js`) — not the loader, which doesn't have one:
 
 ```js
 const CONFIG = {
@@ -117,7 +135,7 @@ shows a larger in-app preview.
   10 minutes.
 - If the API call fails (no signal, bad key, etc.), the widget falls back to
   the last successfully fetched departures and shows a "saved data" note.
-- The two scripts are intentionally near-duplicates (Scriptable widgets are
-  simplest as standalone, copy-pasteable files) rather than sharing a
-  library file. If you tweak the matching logic in one, mirror the change
-  in the other.
+- The two core files are intentionally near-duplicates (Scriptable widgets
+  are simplest as standalone files) rather than sharing more logic between
+  them. If you tweak the matching logic in one, mirror the change in the
+  other. The two loaders are likewise near-duplicates of each other.
